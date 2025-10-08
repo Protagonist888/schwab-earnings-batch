@@ -1,0 +1,30 @@
+name: Weekly Earnings Batch
+
+on:
+  schedule:
+    # Run every Sunday at 2 AM UTC [cite: 442, 443]
+    - cron: '0 2 * * 0'
+  workflow_dispatch:  # Allow manual trigger for testing 
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run batch processor
+        env:
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+        run: npm run process
