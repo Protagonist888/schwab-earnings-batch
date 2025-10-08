@@ -1,0 +1,12 @@
+{
+  "name": "schwab-earnings-batch",
+  "version": "1.0.0",
+  "description": "Weekly batch processor for earnings data",
+  "main": "process-earnings.js",
+  "scripts": {
+    "process": "node process-earnings.js"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.22.0"
+  }
+}
