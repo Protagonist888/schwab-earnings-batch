@@ -39,7 +39,6 @@ async function fetchJSON(url) {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        console.log('API Resonse Body:', data); // Debug log to see the raw response
         if (res.statusCode === 200) {
           try {
             resolve(JSON.parse(data)); 
@@ -71,7 +70,7 @@ async function processSymbol(symbol) {
     const formatDate = (date) => {
       return date.toISOString().split('T')[0]; 
     };
-    const calendarUrl = `https://eodhd.com/api/calendar/earnings?api_token=${EODHD_API_KEY}&symbols=${symbol}.US&from=${formatDate(twoYearsAgo)}&to=${formatDate(oneYearFuture)}`;
+    const calendarUrl = `https://eodhd.com/api/calendar/earnings?api_token=${EODHD_API_KEY}&symbols=${symbol}.US&from=${formatDate(twoYearsAgo)}&to=${formatDate(oneYearFuture)}&fmt=json`;
 
     const earningsData = await fetchJSON(calendarUrl); 
 
