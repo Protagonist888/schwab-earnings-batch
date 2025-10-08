@@ -39,6 +39,7 @@ async function fetchJSON(url) {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
+        console.log('API Resonse Body:', data); // Debug log to see the raw response
         if (res.statusCode === 200) {
           try {
             resolve(JSON.parse(data)); 
