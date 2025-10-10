@@ -154,7 +154,7 @@ function findPriceOnDate(priceData, targetDate) {
 
 async function main() {
   //const SYMBOLS = await getAllSymbols(); // Use the dynamic list [cite: 380]
-  const SYMBOLS = ['DAL','NEOG','APLD']; // For testing, use a small static list
+  const SYMBOLS = ['DAL','NEOG','APLD','AAPL','CRWV','NVDA','MSFT']; // For testing, use a small static list
   console.log(`Starting batch processing for ${SYMBOLS.length} symbols...`); 
 
   let processed = 0; 
