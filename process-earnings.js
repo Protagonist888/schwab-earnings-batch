@@ -33,22 +33,37 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms)); 
 }
 
-async function fetchJSON(url) {
+async function fetchJSON(url, attempt = 1, maxRetries = 5) {
   return new Promise((resolve, reject) => {
     https.get(url, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
-      res.on('end', () => {
+      res.on('end', async () => {
         if (res.statusCode === 200) {
           try {
             resolve(JSON.parse(data)); 
           } catch (e) {
-            reject(new Error('Invalid JSON')); 
+            reject(new Error(`Invalid JSON: ${data.substring(0, 50)}...`)); 
           }
         } else if (res.statusCode === 404) {
           resolve({ notFound: true }); 
+        } else if (res.statusCode === 429 || res.statusCode >= 500) {
+          // **RATE LIMIT/SERVER ERROR HANDLING**
+          if (attempt < maxRetries) {
+            // Exponential backoff with jitter
+            const delay = Math.pow(2, attempt) * 1000 + Math.random() * 500;
+            console.log(`Rate limit (429/5xx) hit. Retrying in ${Math.round(delay/1000)}s (Attempt ${attempt}/${maxRetries})`);
+            await sleep(delay);
+            
+            // Recursive retry
+            resolve(fetchJSON(url, attempt + 1, maxRetries));
+          } else {
+            // Max retries reached
+            reject(new Error(`API returned ${res.statusCode} after ${maxRetries} retries`)); 
+          }
         } else {
-          reject(new Error(`API returned ${res.statusCode}`)); 
+          // Non-retryable 400-level error
+          reject(new Error(`API returned ${res.statusCode} (Error: ${data.substring(0, 50)}...)`)); 
         }
       });
       res.on('error', reject);
@@ -157,31 +172,43 @@ function findPriceOnDate(priceData, targetDate) {
 }
 
 async function main() {
-  const SYMBOLS = await getAllSymbols(); // Use the dynamic list [cite: 380]
-  //const SYMBOLS = ['DAL','NEOG','APLD','AAPL','CRWV','NVDA','MSFT']; // For testing, use a small static list
+  const SYMBOLS = await getAllSymbols(); 
+  // const SYMBOLS = ['DAL','NEOG','APLD','AAPL','CRWV','NVDA','MSFT']; // Keep for local dev
   console.log(`Starting batch processing for ${SYMBOLS.length} symbols...`); 
 
   let processed = 0; 
   let successful = 0; 
   let failed = 0; 
 
-  // Process in batches to respect rate limits [cite: 385]
+  const BATCH_SIZE = 900; // Still use 900
+  const BATCH_DELAY_MS = 75000; // 75 seconds for safer rate limit reset
+
   for (let i = 0; i < SYMBOLS.length; i += BATCH_SIZE) {
     const batch = SYMBOLS.slice(i, i + BATCH_SIZE); 
     console.log(`\nBatch ${Math.floor(i / BATCH_SIZE) + 1}: Processing ${batch.length} symbols`); 
 
-    const results = await Promise.all(batch.map(symbol => processSymbol(symbol))); 
+    // **CRITICAL FIX 2: Sequential processing with micro-delay**
+    const results = [];
+    for (const symbol of batch) {
+        const result = await processSymbol(symbol);
+        results.push(result);
+        
+        // Micro-delay to spread the load (70ms)
+        await sleep(70); 
+    }
+    // End Critical Fix 2
 
+    // Update counters (logic remains the same)
     processed += batch.length; 
     successful += results.filter(r => r !== null).length; 
     failed += results.filter(r => r === null).length; 
 
     console.log(`Progress: ${processed}/${SYMBOLS.length} (${successful} successful, ${failed} failed)`); 
 
-    // Wait 60 seconds between batches to reset rate limit [cite: 394]
+    // Wait 75 seconds between batches (Increased delay)
     if (i + BATCH_SIZE < SYMBOLS.length) {
-      console.log('Waiting 60 seconds before next batch...'); 
-      await sleep(60000); 
+      console.log(`Waiting ${BATCH_DELAY_MS / 1000} seconds before next batch...`); 
+      await sleep(BATCH_DELAY_MS); 
     }
   }
 
