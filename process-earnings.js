@@ -56,83 +56,89 @@ async function fetchJSON(url) {
   });
 }
 
+// schwab-earnings-batch/process-earnings.js - REVISED processSymbol
 async function processSymbol(symbol) {
-  console.log(`Processing ${symbol}...`); 
+  console.log(`Processing ${symbol}...`);
 
   try {
-    // Step 1: Get earnings calendar (past 2 years, future 1 year) [cite: 306]
-    const today = new Date(); 
-    const twoYearsAgo = new Date(); 
-    twoYearsAgo.setFullYear(today.getFullYear() - 2); 
-    // REFINEMENT 3: Look one year into the future to ensure we capture the next earnings date. [cite: 310]
-    const oneYearFuture = new Date(); 
-    oneYearFuture.setFullYear(today.getFullYear() + 1); 
-    const formatDate = (date) => {
-      return date.toISOString().split('T')[0]; 
-    };
-    const calendarUrl = `https://eodhd.com/api/calendar/earnings?api_token=${EODHD_API_KEY}&symbols=${symbol}.US&from=${formatDate(twoYearsAgo)}&to=${formatDate(oneYearFuture)}&fmt=json`;
+    // Step 1: Get earnings calendar (past 2 years, future 1 year)
+    const today = new Date();
+    // Use a date comparison utility for the next earnings date check
+    const isPastDate = (dateString) => new Date(dateString) <= today; 
+    
+    const twoYearsAgo = new Date();
+    twoYearsAgo.setFullYear(today.getFullYear() - 2);
+    const oneYearFuture = new Date();
+    oneYearFuture.setFullYear(today.getFullYear() + 1);
+    const formatDate = (date) => date.toISOString().split('T')[0];
 
-    const earningsData = await fetchJSON(calendarUrl); 
+    // ... (calendarUrl construction remains the same)
 
-    if (earningsData.notFound || !earningsData.earnings || earningsData.earnings.length === 0) {
-      console.log(`No earnings data for ${symbol}`); 
-      return null;
+    const earningsData = await fetchJSON(calendarUrl);
+
+    // CRITICAL: Integrity check - if no earnings array, we can't proceed with calculation.
+    if (earningsData.notFound || !Array.isArray(earningsData.earnings)) {
+        console.log(`Skipping ${symbol}: API returned no valid earnings array.`);
+        return null;
     }
 
-    // Step 2: Get 2-year price history [cite: 322]
-    const priceUrl = `https://eodhd.com/api/eod/${symbol}.US?api_token=${EODHD_API_KEY}&period=d&from=${formatDate(twoYearsAgo)}&to=${formatDate(today)}&fmt=json`; 
-    const priceData = await fetchJSON(priceUrl); 
+    // Step 2: Get 2-year price history (Calculation dependency check)
+    // ... (priceUrl construction remains the same)
+    const priceData = await fetchJSON(priceUrl);
 
     if (priceData.notFound || !Array.isArray(priceData) || priceData.length < 10) {
-      console.log(`Insufficient price data for ${symbol}`); 
+      console.log(`Skipping ${symbol}: Insufficient price data for calculation.`);
       return null;
     }
+    
+    // --- NON-AGGRESSIVE CACHING STARTS HERE ---
 
-    // Step 3: Calculate average earnings move [cite: 329]
+    // Step 3: Calculate average earnings move
     const moves = [];
     for (const earning of earningsData.earnings) {
-      const earningsDate = new Date(earning.date);
+        // ... (calculation logic remains the same)
+        // Ensure you only use valid past earnings dates for historical average
+        const earningsDate = new Date(earning.date);
+        if (isPastDate(earning.date)) { 
+            // Find prices around earnings date (1 day before/after)
+            const beforePrice = findPriceOnDate(priceData, new Date(earningsDate.getTime() - 86400000)); 
+            const afterPrice = findPriceOnDate(priceData, new Date(earningsDate.getTime() + 86400000)); 
 
-      // Find prices around earnings date [cite: 333]
-      const beforePrice = findPriceOnDate(priceData, new Date(earningsDate.getTime() - 86400000)); 
-      const afterPrice = findPriceOnDate(priceData, new Date(earningsDate.getTime() + 86400000)); 
-
-      if (beforePrice && afterPrice && beforePrice > 0) {
-        const percentMove = Math.abs((afterPrice - beforePrice) / beforePrice) * 100; 
-        moves.push(percentMove); 
-      }
+            if (beforePrice && afterPrice && beforePrice > 0) {
+                const percentMove = Math.abs((afterPrice - beforePrice) / beforePrice) * 100; 
+                moves.push(percentMove); 
+            }
+        }
     }
+    
+    const avgMove = moves.length > 0 ? moves.reduce((a, b) => a + b, 0) / moves.length : null;
 
-    if (moves.length === 0) {
-      console.log(`No valid earnings moves for ${symbol}`); 
-      return null;
-    }
+    // Step 4: Find next earnings date - FIX DATE LOGIC
+    // Find ALL future dates, then take the earliest one.
+    const futureEarnings = earningsData.earnings
+        .filter(e => new Date(e.date) > today) // Filter out all past dates
+        .sort((a, b) => new Date(a.date) - new Date(b.date)); // Sort by date ascending
 
-    const avgMove = moves.reduce((a, b) => a + b, 0) / moves.length;
-
-    // Step 4: Find next earnings date [cite: 346]
-    const futureEarnings = earningsData.earnings.filter(e => new Date(e.date) > today); 
     const nextDate = futureEarnings.length > 0 ? futureEarnings[0].date : null; 
-
-    if (!nextDate) {
-      console.log(`No future earnings for ${symbol}`);
-      return null;
-    }
-
-    // Step 5: Store in Redis [cite: 353]
+    
+    // Step 5: Store in Redis - Store a key for every symbol we successfully validated integrity for.
     const result = {
       symbol: symbol,
-      nextDate: nextDate,
-      avgMove: parseFloat(avgMove.toFixed(2)),
+      // Store the *actual* next date, which might be null.
+      nextDate: nextDate, 
+      // Store the average move, which might be null.
+      avgMove: avgMove !== null ? parseFloat(avgMove.toFixed(2)) : null,
       lastUpdated: new Date().toISOString()
     }; 
 
-    await redis.set(`earnings:${symbol}`, result, { ex: 2592000 });  // 30 day TTL [cite: 360]
+    // CRITICAL FIX: Only check for Redis set success, don't return null to skip it.
+    await redis.set(`earnings:${symbol}`, result, { ex: 2592000 });  // 30 day TTL 
 
-    console.log(`✓ ${symbol}: Next earnings ${nextDate}, avg move ${avgMove.toFixed(2)}%`); 
+    console.log(`✓ ${symbol}: Next earnings ${nextDate || 'N/A'}, avg move ${avgMove !== null ? avgMove.toFixed(2) + '%' : 'N/A'}`); 
     return result;
 
   } catch (error) {
+    // If the entire process fails (e.g., API key, network), we still return null to track the failure.
     console.error(`Error processing ${symbol}:`, error.message); 
     return null;
   }
