@@ -60,30 +60,30 @@ async function fetchJSON(url) {
 async function processSymbol(symbol) {
   console.log(`Processing ${symbol}...`);
 
+  // --- Date Setup ---
+  const today = new Date();
+  const isPastDate = (dateString) => new Date(dateString) <= today; 
+  const twoYearsAgo = new Date();
+  twoYearsAgo.setFullYear(today.getFullYear() - 2);
+  const oneYearFuture = new Date();
+  oneYearFuture.setFullYear(today.getFullYear() + 1);
+  const formatDate = (date) => date.toISOString().split('T')[0];
+
+  // **CRITICAL FIX 1: Ensure calendarUrl is defined BEFORE its use.**
+  const calendarUrl = `https://eodhd.com/api/calendar/earnings?api_token=${EODHD_API_KEY}&symbols=${symbol}.US&from=${formatDate(twoYearsAgo)}&to=${formatDate(oneYearFuture)}&fmt=json`;
+
   try {
-    // Step 1: Get earnings calendar (past 2 years, future 1 year)
-    const today = new Date();
-    // Use a date comparison utility for the next earnings date check
-    const isPastDate = (dateString) => new Date(dateString) <= today; 
-    
-    const twoYearsAgo = new Date();
-    twoYearsAgo.setFullYear(today.getFullYear() - 2);
-    const oneYearFuture = new Date();
-    oneYearFuture.setFullYear(today.getFullYear() + 1);
-    const formatDate = (date) => date.toISOString().split('T')[0];
-
-    // ... (calendarUrl construction remains the same)
-
+    // Step 1: Get earnings calendar
     const earningsData = await fetchJSON(calendarUrl);
 
-    // CRITICAL: Integrity check - if no earnings array, we can't proceed with calculation.
+    // CRITICAL INTEGRITY CHECK: Abort if API failed or returned a malformed response
     if (earningsData.notFound || !Array.isArray(earningsData.earnings)) {
         console.log(`Skipping ${symbol}: API returned no valid earnings array.`);
         return null;
     }
 
     // Step 2: Get 2-year price history (Calculation dependency check)
-    // ... (priceUrl construction remains the same)
+    const priceUrl = `https://eodhd.com/api/eod/${symbol}.US?api_token=${EODHD_API_KEY}&period=d&from=${formatDate(twoYearsAgo)}&to=${formatDate(today)}&fmt=json`; 
     const priceData = await fetchJSON(priceUrl);
 
     if (priceData.notFound || !Array.isArray(priceData) || priceData.length < 10) {
@@ -91,13 +91,12 @@ async function processSymbol(symbol) {
       return null;
     }
     
-    // --- NON-AGGRESSIVE CACHING STARTS HERE ---
+    // --- NON-AGGRESSIVE CACHING & CALCULATION STARTS HERE ---
 
     // Step 3: Calculate average earnings move
     const moves = [];
     for (const earning of earningsData.earnings) {
-        // ... (calculation logic remains the same)
-        // Ensure you only use valid past earnings dates for historical average
+        // Only use valid PAST earnings dates for historical average calculation
         const earningsDate = new Date(earning.date);
         if (isPastDate(earning.date)) { 
             // Find prices around earnings date (1 day before/after)
@@ -111,34 +110,33 @@ async function processSymbol(symbol) {
         }
     }
     
+    // Set avgMove to null if no valid moves found (CRITICAL: prevents filtering)
     const avgMove = moves.length > 0 ? moves.reduce((a, b) => a + b, 0) / moves.length : null;
 
     // Step 4: Find next earnings date - FIX DATE LOGIC
     // Find ALL future dates, then take the earliest one.
     const futureEarnings = earningsData.earnings
-        .filter(e => new Date(e.date) > today) // Filter out all past dates
+        .filter(e => new Date(e.date) > today) // Filter out all past dates (fixes ZS issue)
         .sort((a, b) => new Date(a.date) - new Date(b.date)); // Sort by date ascending
 
+    // Set nextDate to null if no future earnings found (CRITICAL: prevents filtering)
     const nextDate = futureEarnings.length > 0 ? futureEarnings[0].date : null; 
     
-    // Step 5: Store in Redis - Store a key for every symbol we successfully validated integrity for.
+    // Step 5: Store in Redis - Always store if integrity checks passed (Steps 1 & 2)
     const result = {
       symbol: symbol,
-      // Store the *actual* next date, which might be null.
-      nextDate: nextDate, 
-      // Store the average move, which might be null.
-      avgMove: avgMove !== null ? parseFloat(avgMove.toFixed(2)) : null,
+      nextDate: nextDate, // Can be null
+      avgMove: avgMove !== null ? parseFloat(avgMove.toFixed(2)) : null, // Can be null
       lastUpdated: new Date().toISOString()
     }; 
 
-    // CRITICAL FIX: Only check for Redis set success, don't return null to skip it.
     await redis.set(`earnings:${symbol}`, result, { ex: 2592000 });  // 30 day TTL 
 
     console.log(`✓ ${symbol}: Next earnings ${nextDate || 'N/A'}, avg move ${avgMove !== null ? avgMove.toFixed(2) + '%' : 'N/A'}`); 
     return result;
 
   } catch (error) {
-    // If the entire process fails (e.g., API key, network), we still return null to track the failure.
+    // If the entire process fails due to a network or unexpected error, return null.
     console.error(`Error processing ${symbol}:`, error.message); 
     return null;
   }
