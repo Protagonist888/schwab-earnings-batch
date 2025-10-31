@@ -13,20 +13,46 @@ const BATCH_SIZE = 900;  // Stay under 1000/min rate limit [cite: 261]
 
 // REFINEMENT 1: Dynamically fetch all US symbols instead of using a static file. [cite: 262]
 async function getAllSymbols() { 
-  console.log('Fetching latest list of US exchange symbols...');
-  try {
-    // This example fetches from the general 'US' exchange. [cite: 266]
-    const url = `https://eodhd.com/api/exchange-symbol-list/US?api_token=${EODHD_API_KEY}&fmt=json`; 
-    const exchanges = await fetchJSON(url); 
-    // The result is an array of objects like {Code: "AAPL", Name: "Apple Inc"}. We just need the "Code". [cite: 269]
-    const symbols = exchanges.map(stock => stock.Code); 
-    console.log(`Successfully fetched ${symbols.length} symbols.`); 
-    return symbols;
-  } catch (error) {
-    console.error('CRITICAL: Failed to fetch symbol list. Aborting batch.', error);
-    // Exit the process with an error code so GitHub Actions marks it as a failure. [cite: 275]
-    process.exit(1); 
+  console.log('Fetching latest list of NYSE and NASDAQ symbols (Active Equities)...');
+  const exchanges = ['XNYS', 'XNAS']; // NYSE and NASDAQ codes
+  let symbols = [];
+  
+  for (const exchange of exchanges) {
+      try {
+          // Fetch the list from EODHD
+          // Note: We MUST request the full fields to get 'Price' for filtering.
+          const url = `https://eodhd.com/api/exchange-symbol-list/${exchange}?api_token=${EODHD_API_KEY}&fmt=json&type=Common Stock`; 
+          const response = await fetchJSON(url); 
+          
+          if (Array.isArray(response)) {
+              // We filter the result aggressively on the client side for relevance and liquidity.
+              const exchangeSymbols = response
+                  .filter(stock => 
+                      // 1. Filter by Type (Equities and ETFs)
+                      (stock.Type === 'Common Stock' || stock.Type === 'ETFs' || stock.Type === 'REIT') &&
+                      // 2. FILTER OUT NON-ACTIVE/PENNY STOCKS: Filter by Price > $1.00
+                      stock.Price > 1.00
+                  )
+                  .map(stock => stock.Code);
+                  
+              symbols = symbols.concat(exchangeSymbols);
+              console.log(`Successfully fetched ${exchangeSymbols.length} active symbols from ${exchange}.`); 
+          }
+      } catch (error) {
+          console.error(`Warning: Failed to fetch symbols from ${exchange} after retries. Continuing.`, error);
+      }
   }
+
+  // Remove duplicates (just in case a symbol is cross-listed)
+  const uniqueSymbols = Array.from(new Set(symbols));
+  console.log(`Final unique symbol count for active equities: ${uniqueSymbols.length}.`); 
+
+  if (uniqueSymbols.length < 1000) {
+      console.error('CRITICAL: Final symbol count is too low for the entire U.S. market. Aborting batch.');
+      process.exit(1); 
+  }
+  
+  return uniqueSymbols;
 }
 
 async function sleep(ms) {
@@ -171,6 +197,8 @@ function findPriceOnDate(priceData, targetDate) {
   return null; // Return null if no price is found within 5 days. [cite: 377]
 }
 
+const MAX_BATCHES_PER_RUN = 10; // Process a maximum of 10 batches (9,000 symbols)
+
 async function main() {
   const SYMBOLS = await getAllSymbols(); 
   // const SYMBOLS = ['DAL','NEOG','APLD','AAPL','CRWV','NVDA','MSFT']; // Keep for local dev
@@ -179,11 +207,18 @@ async function main() {
   let processed = 0; 
   let successful = 0; 
   let failed = 0; 
+  let batchesRun = 0;
 
   const BATCH_SIZE = 900; // Still use 900
   const BATCH_DELAY_MS = 75000; // 75 seconds for safer rate limit reset
 
   for (let i = 0; i < SYMBOLS.length; i += BATCH_SIZE) {
+
+    if (batchesRun >= MAX_BATCHES_PER_RUN) {
+      console.log('\nSTOPPING: Reached maximum ${MAX_BATCHES_PER_RUN} batches for this run.');
+      break;
+    }
+
     const batch = SYMBOLS.slice(i, i + BATCH_SIZE); 
     console.log(`\nBatch ${Math.floor(i / BATCH_SIZE) + 1}: Processing ${batch.length} symbols`); 
 
