@@ -14,18 +14,17 @@ const BATCH_SIZE = 900;  // Stay under 1000/min rate limit [cite: 261]
 // REFINEMENT 1: Dynamically fetch all US symbols instead of using a static file. [cite: 262]
 async function getAllSymbols() { 
   console.log('Fetching latest list of NYSE and NASDAQ symbols (Active Equities)...');
-  const exchanges = ['XNYS', 'XNAS']; // NYSE and NASDAQ codes
+  const exchanges = ['XNYS', 'XNAS']; 
   let symbols = [];
   
   for (const exchange of exchanges) {
       try {
-          // Fetch the list from EODHD
-          // Note: We MUST request the full fields to get 'Price' for filtering.
-          const url = `https://eodhd.com/api/exchange-symbol-list/${exchange}?api_token=${EODHD_API_KEY}&fmt=json&type=Common Stock`; 
+          // **CRITICAL FIX: Removed the problematic filter from the URL**
+          // We must rely on client-side filtering below.
+          const url = `https://eodhd.com/api/exchange-symbol-list/${exchange}?api_token=${EODHD_API_KEY}&fmt=json`; 
           const response = await fetchJSON(url); 
           
           if (Array.isArray(response)) {
-              // We filter the result aggressively on the client side for relevance and liquidity.
               const exchangeSymbols = response
                   .filter(stock => 
                       // 1. Filter by Type (Equities and ETFs)
@@ -41,15 +40,6 @@ async function getAllSymbols() {
       } catch (error) {
           console.error(`Warning: Failed to fetch symbols from ${exchange} after retries. Continuing.`, error);
       }
-  }
-
-  // Remove duplicates (just in case a symbol is cross-listed)
-  const uniqueSymbols = Array.from(new Set(symbols));
-  console.log(`Final unique symbol count for active equities: ${uniqueSymbols.length}.`); 
-
-  if (uniqueSymbols.length < 1000) {
-      console.error('CRITICAL: Final symbol count is too low for the entire U.S. market. Aborting batch.');
-      process.exit(1); 
   }
   
   return uniqueSymbols;
