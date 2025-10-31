@@ -9,13 +9,13 @@ const redis = new Redis({
 });
 
 const EODHD_API_KEY = process.env.EODHD_API_KEY;
-const BATCH_SIZE = 900;  // Stay under 1000/min rate limit [cite: 261]
+const BATCH_SIZE = 900;  // Stay under 1000/min rate limit 
 
-// REFINEMENT 1: Dynamically fetch all US symbols instead of using a static file. [cite: 262]
+// REFINEMENT 1: Dynamically fetch all US symbols instead of using a static file. 
 async function getAllSymbols() { 
     console.log('Fetching list of major exchanges using maximum permissiveness...');
     
-    const exchanges = ['XNAS', 'XNYS', 'OTCM']; 
+    const exchanges = ['NYSE', 'NASDAQ']
     let symbols = []; 
     
     for (const exchange of exchanges) {
