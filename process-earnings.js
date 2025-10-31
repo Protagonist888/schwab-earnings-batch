@@ -22,7 +22,7 @@ async function getAllSymbols() {
         try {
             // FIX: Removed all optional parameters from the URL (delisted=0) 
             // We rely on the API's default of returning current/active tickers.
-            const url = `https://eodhd.com/api/exchange-symbol-list/${exchange}?api_token=${EODHD_API_KEY}&fmt=json`; 
+            const url = `https://eodhd.com/api/exchange-symbol-list/${exchange}?api_token=${EODHD_API_KEY}&delisted=0&fmt=json`; 
             const response = await fetchJSON(url); 
             
             if (Array.isArray(response)) {
