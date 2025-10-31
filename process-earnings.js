@@ -15,7 +15,7 @@ const BATCH_SIZE = 900;  // Stay under 1000/min rate limit [cite: 261]
 async function getAllSymbols() { 
   console.log('Fetching latest list of NYSE and NASDAQ symbols (Active Equities)...');
   const exchanges = ['XNYS', 'XNAS']; 
-  let symbols = [];
+  let uniqueSymbols = [];
   
   for (const exchange of exchanges) {
       try {
@@ -34,7 +34,7 @@ async function getAllSymbols() {
                   )
                   .map(stock => stock.Code);
                   
-              symbols = symbols.concat(exchangeSymbols);
+              uniqueSymbols = symbols.concat(exchangeSymbols);
               console.log(`Successfully fetched ${exchangeSymbols.length} active symbols from ${exchange}.`); 
           }
       } catch (error) {
