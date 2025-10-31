@@ -13,44 +13,45 @@ const BATCH_SIZE = 900;  // Stay under 1000/min rate limit [cite: 261]
 
 // REFINEMENT 1: Dynamically fetch all US symbols instead of using a static file. [cite: 262]
 async function getAllSymbols() { 
-    console.log('Fetching latest list of NYSE and NASDAQ symbols (Active Equities, filtered)...');
+    console.log('Fetching list of major exchanges using maximum permissiveness...');
     
-    // XNAS (NASDAQ), XNYS (NYSE), OTCM (OTC Markets - relevant for small caps, keeping the 'OTCM' from your previous code)
     const exchanges = ['XNAS', 'XNYS', 'OTCM']; 
     let symbols = []; 
     
     for (const exchange of exchanges) {
         try {
-            // CRITICAL FIX 1: Explicitly set delisted=0 in the URL to ensure only ACTIVE symbols are returned.
-            // This is safer than relying on the API's default behavior.
-            const url = `https://eodhd.com/api/exchange-symbol-list/${exchange}?api_token=${EODHD_API_KEY}&delisted=0&fmt=json`; 
+            // FIX: Removed all optional parameters from the URL (delisted=0) 
+            // We rely on the API's default of returning current/active tickers.
+            const url = `https://eodhd.com/api/exchange-symbol-list/${exchange}?api_token=${EODHD_API_KEY}&fmt=json`; 
             const response = await fetchJSON(url); 
             
             if (Array.isArray(response)) {
                 const exchangeSymbols = response
-                    .filter(stock => 
-                        // CRITICAL FIX 2: Using the observed Title Case from JSON responses for accurate filtering.
-                        (stock.Type === 'Common Stock' || 
-                         stock.Type === 'ETFs' || 
-                         stock.Type === 'Fund' || // Added 'Fund' for completeness
-                         stock.Type === 'REIT')
-                    )
+                    .filter(stock => {
+                        const type = (stock.Type || '').toUpperCase();
+                        // FIX: Use a robust filter covering all relevant types (Common Stock, ETFs, REITs, Warrants/Rights/Funds as a fallback)
+                        return (
+                            type.includes('STOCK') || 
+                            type.includes('ETF') || 
+                            type.includes('REIT') || 
+                            type.includes('FUND')
+                        );
+                    })
                     .map(stock => stock.Code);
                     
                 symbols = symbols.concat(exchangeSymbols); 
-                console.log(`Successfully fetched ${exchangeSymbols.length} active symbols from ${exchange}.`); 
+                console.log(`Successfully fetched ${exchangeSymbols.length} symbols from ${exchange}.`); 
             }
         } catch (error) {
             console.error(`Warning: Failed to fetch symbols from ${exchange} after retries. Continuing.`, error);
         }
     }
     
-    // Calculate unique symbols at the end
     const uniqueSymbols = Array.from(new Set(symbols));
-    
-    console.log(`Final unique symbol count for active equities: ${uniqueSymbols.length}.`); 
+    console.log(`Final unique symbol count: ${uniqueSymbols.length}.`); 
 
-    if (uniqueSymbols.length < 1000) {
+    // Re-setting the critical low threshold to 1000.
+    if (uniqueSymbols.length < 1000) { 
         console.error('CRITICAL: Final symbol count is too low. Aborting batch.');
         process.exit(1); 
     }
