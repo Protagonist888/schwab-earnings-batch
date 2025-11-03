@@ -142,8 +142,8 @@ async function processSymbol(symbol) {
     const moves = [];
     for (const earning of earningsData.earnings) {
         // Only use valid PAST earnings dates for historical average calculation
-        const earningsDate = new Date(earning.date);
-        if (isPastDate(earning.date)) { 
+        const earningsDate = new Date(earning.report_date);
+        if (isPastDate(earning.report_date)) { 
             // Find prices around earnings date (1 day before/after)
             const beforePrice = findPriceOnDate(priceData, new Date(earningsDate.getTime() - 86400000)); 
             const afterPrice = findPriceOnDate(priceData, new Date(earningsDate.getTime() + 86400000)); 
@@ -161,11 +161,11 @@ async function processSymbol(symbol) {
     // Step 4: Find next earnings date - FIX DATE LOGIC
     // Find ALL future dates, then take the earliest one.
     const futureEarnings = earningsData.earnings
-        .filter(e => new Date(e.date) > today) // Filter out all past dates (fixes ZS issue)
-        .sort((a, b) => new Date(a.date) - new Date(b.date)); // Sort by date ascending
+        .filter(e => new Date(e.report_date) > today) // Filter out all past dates (fixes ZS issue)
+        .sort((a, b) => new Date(a.report_date) - new Date(b.report_date)); // Sort by date ascending
 
     // Set nextDate to null if no future earnings found (CRITICAL: prevents filtering)
-    const nextDate = futureEarnings.length > 0 ? futureEarnings[0].date : null; 
+    const nextDate = futureEarnings.length > 0 ? futureEarnings[0].report_date : null; 
     
     // Step 5: Store in Redis - Always store if integrity checks passed (Steps 1 & 2)
     const result = {
