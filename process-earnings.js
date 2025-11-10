@@ -1,4 +1,5 @@
 // schwab-earnings-batch/process-earnings.js
+require('dotenv').config();
 const https = require('https');
 const { Redis } = require('@upstash/redis');
 const { DateUtils } = require('./date_utils');
@@ -184,7 +185,7 @@ const MAX_BATCHES_PER_RUN = 10; // Process a maximum of 10 batches (9,000 symbol
 
 async function main() {
   const SYMBOLS = await getAllSymbols(); 
-  // const SYMBOLS = ['DAL','NEOG','APLD','AAPL','CRWV','NVDA','MSFT']; // Keep for local dev
+  //const SYMBOLS = ['DAL','NEOG','APLD','AAPL','CRWV','NVDA','MSFT']; // Keep for local dev
   console.log(`Starting batch processing for ${SYMBOLS.length} symbols...`); 
 
   let processed = 0; 
