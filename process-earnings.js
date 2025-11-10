@@ -1,6 +1,7 @@
 // schwab-earnings-batch/process-earnings.js
 const https = require('https');
 const { Redis } = require('@upstash/redis');
+const { DateUtils } = require('./date_utils');
 
 // Initialize Redis
 const redis = new Redis({
@@ -101,34 +102,25 @@ async function fetchJSON(url, attempt = 1, maxRetries = 5) {
   });
 }
 
-// schwab-earnings-batch/process-earnings.js - REVISED processSymbol
+// schwab-earnings-batch/process-earnings.js - REVISED processSymbol with DateUtils
 async function processSymbol(symbol) {
   console.log(`Processing ${symbol}...`);
 
-  // --- Date Setup ---
-  const today = new Date();
-  const isPastDate = (dateString) => new Date(dateString) <= today; 
-  const twoYearsAgo = new Date();
-  twoYearsAgo.setFullYear(today.getFullYear() - 2);
-  const oneYearFuture = new Date();
-  oneYearFuture.setFullYear(today.getFullYear() + 1);
-  const formatDate = (date) => date.toISOString().split('T')[0];
-
-  // **CRITICAL FIX 1: Ensure calendarUrl is defined BEFORE its use.**
-  const calendarUrl = `https://eodhd.com/api/calendar/earnings?api_token=${EODHD_API_KEY}&symbols=${symbol}.US&from=${formatDate(twoYearsAgo)}&to=${formatDate(oneYearFuture)}&fmt=json`;
+  // --- Date Setup (Timezone-Safe) ---
+  const dateRange = DateUtils.getDateRange(730, 365); // 2 years back, 1 year forward
+  const calendarUrl = `https://eodhd.com/api/calendar/earnings?api_token=${EODHD_API_KEY}&symbols=${symbol}.US&from=${dateRange.from}&to=${dateRange.to}&fmt=json`;
 
   try {
     // Step 1: Get earnings calendar
     const earningsData = await fetchJSON(calendarUrl);
 
-    // CRITICAL INTEGRITY CHECK: Abort if API failed or returned a malformed response
     if (earningsData.notFound || !Array.isArray(earningsData.earnings)) {
         console.log(`Skipping ${symbol}: API returned no valid earnings array.`);
         return null;
     }
 
-    // Step 2: Get 2-year price history (Calculation dependency check)
-    const priceUrl = `https://eodhd.com/api/eod/${symbol}.US?api_token=${EODHD_API_KEY}&period=d&from=${formatDate(twoYearsAgo)}&to=${formatDate(today)}&fmt=json`; 
+    // Step 2: Get 2-year price history
+    const priceUrl = `https://eodhd.com/api/eod/${symbol}.US?api_token=${EODHD_API_KEY}&period=d&from=${dateRange.from}&to=${DateUtils.formatApiDate(DateUtils.getTodayNormalized())}&fmt=json`;
     const priceData = await fetchJSON(priceUrl);
 
     if (priceData.notFound || !Array.isArray(priceData) || priceData.length < 10) {
@@ -136,69 +128,56 @@ async function processSymbol(symbol) {
       return null;
     }
     
-    // --- NON-AGGRESSIVE CACHING & CALCULATION STARTS HERE ---
-
-    // Step 3: Calculate average earnings move
+    // Step 3: Calculate average earnings move (ONLY past dates)
     const moves = [];
     for (const earning of earningsData.earnings) {
-        // Only use valid PAST earnings dates for historical average calculation
-        const earningsDate = new Date(earning.report_date);
-        if (isPastDate(earning.report_date)) { 
-            // Find prices around earnings date (1 day before/after)
-            const beforePrice = findPriceOnDate(priceData, new Date(earningsDate.getTime() - 86400000)); 
-            const afterPrice = findPriceOnDate(priceData, new Date(earningsDate.getTime() + 86400000)); 
+        if (DateUtils.isPastDate(earning.report_date)) {
+            // Calculate day before and after earnings
+            const earningsDate = DateUtils.parseApiDate(earning.report_date);
+            if (!earningsDate) continue;
+            
+            const dayBefore = new Date(earningsDate);
+            dayBefore.setDate(dayBefore.getDate() - 1);
+            const dayAfter = new Date(earningsDate);
+            dayAfter.setDate(dayAfter.getDate() + 1);
+            
+            // Find prices with weekend/holiday lookback
+            const beforePrice = DateUtils.findPriceOnDate(priceData, DateUtils.formatApiDate(dayBefore));
+            const afterPrice = DateUtils.findPriceOnDate(priceData, DateUtils.formatApiDate(dayAfter));
 
             if (beforePrice && afterPrice && beforePrice > 0) {
-                const percentMove = Math.abs((afterPrice - beforePrice) / beforePrice) * 100; 
-                moves.push(percentMove); 
+                const percentMove = Math.abs((afterPrice - beforePrice) / beforePrice) * 100;
+                moves.push(percentMove);
             }
         }
     }
     
-    // Set avgMove to null if no valid moves found (CRITICAL: prevents filtering)
     const avgMove = moves.length > 0 ? moves.reduce((a, b) => a + b, 0) / moves.length : null;
 
-    // Step 4: Find next earnings date - FIX DATE LOGIC
-    // Find ALL future dates, then take the earliest one.
-    const futureEarnings = earningsData.earnings
-        .filter(e => new Date(e.report_date) > today) // Filter out all past dates (fixes ZS issue)
-        .sort((a, b) => new Date(a.report_date) - new Date(b.report_date)); // Sort by date ascending
-
-    // Set nextDate to null if no future earnings found (CRITICAL: prevents filtering)
-    const nextDate = futureEarnings.length > 0 ? futureEarnings[0].report_date : null; 
+    // Step 4: Find next earnings date (timezone-safe)
+    const allEarningsDates = earningsData.earnings.map(e => e.report_date);
+    const nextDate = DateUtils.findNextFutureDate(allEarningsDates);
     
-    // Step 5: Store in Redis - Always store if integrity checks passed (Steps 1 & 2)
+    // Step 5: Store in Redis with calculated metadata
     const result = {
       symbol: symbol,
-      nextDate: nextDate, // Can be null
-      avgMove: avgMove !== null ? parseFloat(avgMove.toFixed(2)) : null, // Can be null
-      lastUpdated: new Date().toISOString()
-    }; 
+      nextDate: nextDate,
+      daysUntil: nextDate ? DateUtils.daysUntil(nextDate) : null,
+      formattedDate: nextDate ? DateUtils.formatDisplayDate(nextDate) : null,
+      avgMove: avgMove !== null ? parseFloat(avgMove.toFixed(2)) : null,
+      lastUpdated: new Date().toISOString(),
+      calculatedAt: DateUtils.formatApiDate(DateUtils.getTodayNormalized())
+    };
 
-    await redis.set(`earnings:${symbol}`, result, { ex: 2592000 });  // 30 day TTL 
+    await redis.set(`earnings:${symbol}`, result, { ex: 2592000 });  // 30 day TTL
 
-    console.log(`✓ ${symbol}: Next earnings ${nextDate || 'N/A'}, avg move ${avgMove !== null ? avgMove.toFixed(2) + '%' : 'N/A'}`); 
+    console.log(`✓ ${symbol}: Next earnings ${nextDate || 'N/A'} (${result.daysUntil} days), avg move ${avgMove !== null ? avgMove.toFixed(2) + '%' : 'N/A'}`);
     return result;
 
   } catch (error) {
-    // If the entire process fails due to a network or unexpected error, return null.
-    console.error(`Error processing ${symbol}:`, error.message); 
+    console.error(`Error processing ${symbol}:`, error.message);
     return null;
   }
-}
-
-// REFINEMENT 2: Make date searching more robust to handle weekends and holidays. [cite: 368]
-function findPriceOnDate(priceData, targetDate) {
-  // Search for up to 5 days backward to find a valid trading day. [cite: 369]
-  for (let i = 0; i < 5; i++) {
-    const dateToTry = new Date(targetDate.getTime() - (i * 86400000)); 
-    const dateString = dateToTry.toISOString().split('T')[0]; 
-    const match = priceData.find(d => d.date === dateString); 
-    if (match) { 
-      return parseFloat(match.close); 
-    }
-  }
-  return null; // Return null if no price is found within 5 days. [cite: 377]
 }
 
 const MAX_BATCHES_PER_RUN = 10; // Process a maximum of 10 batches (9,000 symbols)
@@ -219,9 +198,11 @@ async function main() {
   for (let i = 0; i < SYMBOLS.length; i += BATCH_SIZE) {
 
     if (batchesRun >= MAX_BATCHES_PER_RUN) {
-      console.log('\nSTOPPING: Reached maximum ${MAX_BATCHES_PER_RUN} batches for this run.');
+      console.log(`\nSTOPPING: Reached maximum ${MAX_BATCHES_PER_RUN} batches for this run.`);
       break;
     }
+
+    batchesRun++; // Increment batch counter
 
     const batch = SYMBOLS.slice(i, i + BATCH_SIZE); 
     console.log(`\nBatch ${Math.floor(i / BATCH_SIZE) + 1}: Processing ${batch.length} symbols`); 
