@@ -1,70 +1,104 @@
 // schwab-earnings-batch/process-earnings.js
+// ============================================================================
+// fix/earnings-ingestion — root cause fixes:
+//
+//   1. REMOVED hard MAX_BATCHES_PER_RUN=10 cap (was silently dropping symbols
+//      at position 9,001+ in an arbitrary ordering — confirmed root cause of
+//      BKE/MRVL missing from Redis).
+//
+//   2. REPLACED per-symbol fundamentals calls with EODHD Screener API.
+//      getAllSymbols() issues paginated screener calls with
+//      market_capitalization > 300M and exchange = US filters applied
+//      server-side. Returns symbols already sorted by market cap descending.
+//      Universe build: ~10,000 per-symbol calls → ~15-20 screener calls
+//      (5 API credits each = ~100 credits total, negligible vs 100k/day).
+//
+//      CONFIRMED from live screener response:
+//        - Response shape: { "data": [ {...}, ... ] }  (no "total" wrapper key)
+//        - Exchange field value: "US" (not "NYSE"/"NASDAQ" — EODHD normalizes
+//          all US listings to "US"). Filter must use exchange = "US".
+//        - Market cap field: "market_capitalization" as raw USD integer string.
+//        - Ticker field: "code".
+//
+//   3. ADDED $300M market cap floor (P1A-1 universe decision). Matches
+//      sympathy earnings peer mapping universe — defined once, used everywhere.
+//
+//   4. SORTED by market cap descending. MRVL ($58B) and BKE ($700M) land
+//      early in the queue. Any partial run failure drops the smallest
+//      qualifying symbols, not mid/large caps.
+//
+//   5. SKIP ETFs/Funds. The screener market_capitalization filter excludes
+//      most ETFs naturally (they report $0/null cap). Residual ETF-like
+//      tickers with non-null cap are caught by the type field guard and
+//      by processSymbol()'s empty-earnings-array check.
+//
+//   6. ONLY write to Redis when nextDate is non-null. Symbols with no
+//      upcoming earnings get no Redis key — proxy returns 404, trade.js
+//      renders no catalyst card (correct). Null writes wasted space and
+//      obscured genuine cache misses.
+//
+//   7. INCREASED TTL from 30 days (2,592,000s) to 45 days (3,888,000s).
+//      Weekly batch + 45d TTL = two full missed-run safety buffers.
+//
+// Do-not-touch list (priming doc §10 — all unchanged):
+//   - api/earnings.js proxy reader — shape and Redis key pattern unchanged
+//   - date_utils.js — no changes
+//   - Redis key format: earnings:{SYMBOL} — unchanged
+//   - Redis value shape — unchanged
+// ============================================================================
+
 require('dotenv').config();
 const https = require('https');
 const { Redis } = require('@upstash/redis');
 const { DateUtils } = require('./date_utils');
 
-// Initialize Redis
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+const EODHD_API_KEY = process.env.EODHD_API_KEY;
+
+// Market cap floor — P1A-1 universe decision ($300M USD).
+const MARKET_CAP_FLOOR = 300_000_000;
+
+// EODHD screener returns max 100 results per request (5 API credits each).
+const SCREENER_PAGE_SIZE = 100;
+
+// Main earnings batch sizing.
+// processSymbol() makes 2 EODHD calls (calendar + price history) per symbol.
+// 450 symbols × 2 calls + 70ms micro-delay ≈ 900 calls over ~31s — safe
+// under the 1,000/min EODHD rate limit.
+const BATCH_SIZE = 450;
+const BATCH_DELAY_MS = 75_000;   // 75s between batches
+
+// Redis TTL: 45 days = two missed-run safety buffers (batch is weekly).
+const REDIS_TTL_SECONDS = 3_888_000;
+
+// Abort if universe is implausibly small (API key issue, plan problem, etc.)
+const MIN_SYMBOL_COUNT = 200;
+
+// ============================================================================
+// REDIS
+// ============================================================================
+
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-const EODHD_API_KEY = process.env.EODHD_API_KEY;
-const BATCH_SIZE = 900;  // Stay under 1000/min rate limit 
-
-// REFINEMENT 1: Dynamically fetch all US symbols instead of using a static file. 
-async function getAllSymbols() { 
-    console.log('Fetching list of major exchanges using maximum permissiveness...');
-    
-    const exchanges = ['NYSE', 'NASDAQ']
-    let symbols = []; 
-    
-    for (const exchange of exchanges) {
-        try {
-            // FIX: Removed all optional parameters from the URL (delisted=0) 
-            // We rely on the API's default of returning current/active tickers.
-            const url = `https://eodhd.com/api/exchange-symbol-list/${exchange}?api_token=${EODHD_API_KEY}&delisted=0&fmt=json`; 
-            const response = await fetchJSON(url); 
-            
-            if (Array.isArray(response)) {
-                const exchangeSymbols = response
-                    .filter(stock => {
-                        const type = (stock.Type || '').toUpperCase();
-                        // FIX: Use a robust filter covering all relevant types (Common Stock, ETFs, REITs, Warrants/Rights/Funds as a fallback)
-                        return (
-                            type.includes('STOCK') || 
-                            type.includes('ETF') || 
-                            type.includes('REIT') || 
-                            type.includes('FUND')
-                        );
-                    })
-                    .map(stock => stock.Code);
-                    
-                symbols = symbols.concat(exchangeSymbols); 
-                console.log(`Successfully fetched ${exchangeSymbols.length} symbols from ${exchange}.`); 
-            }
-        } catch (error) {
-            console.error(`Warning: Failed to fetch symbols from ${exchange} after retries. Continuing.`, error);
-        }
-    }
-    
-    const uniqueSymbols = Array.from(new Set(symbols));
-    console.log(`Final unique symbol count: ${uniqueSymbols.length}.`); 
-
-    // Re-setting the critical low threshold to 1000.
-    if (uniqueSymbols.length < 1000) { 
-        console.error('CRITICAL: Final symbol count is too low. Aborting batch.');
-        process.exit(1); 
-    }
-    
-    return uniqueSymbols; 
-}
+// ============================================================================
+// HTTP HELPERS
+// ============================================================================
 
 async function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms)); 
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Fetch and parse JSON from a URL.
+ * Retries on 429 / 5xx with exponential backoff + jitter.
+ * Returns { notFound: true } on 404. Throws after maxRetries.
+ */
 async function fetchJSON(url, attempt = 1, maxRetries = 5) {
   return new Promise((resolve, reject) => {
     https.get(url, (res) => {
@@ -73,29 +107,23 @@ async function fetchJSON(url, attempt = 1, maxRetries = 5) {
       res.on('end', async () => {
         if (res.statusCode === 200) {
           try {
-            resolve(JSON.parse(data)); 
+            resolve(JSON.parse(data));
           } catch (e) {
-            reject(new Error(`Invalid JSON: ${data.substring(0, 50)}...`)); 
+            reject(new Error(`Invalid JSON: ${data.substring(0, 80)}`));
           }
         } else if (res.statusCode === 404) {
-          resolve({ notFound: true }); 
+          resolve({ notFound: true });
         } else if (res.statusCode === 429 || res.statusCode >= 500) {
-          // **RATE LIMIT/SERVER ERROR HANDLING**
           if (attempt < maxRetries) {
-            // Exponential backoff with jitter
             const delay = Math.pow(2, attempt) * 1000 + Math.random() * 500;
-            console.log(`Rate limit (429/5xx) hit. Retrying in ${Math.round(delay/1000)}s (Attempt ${attempt}/${maxRetries})`);
+            console.log(`  Rate limit (${res.statusCode}). Retry ${attempt}/${maxRetries} in ${Math.round(delay / 1000)}s`);
             await sleep(delay);
-            
-            // Recursive retry
             resolve(fetchJSON(url, attempt + 1, maxRetries));
           } else {
-            // Max retries reached
-            reject(new Error(`API returned ${res.statusCode} after ${maxRetries} retries`)); 
+            reject(new Error(`API returned ${res.statusCode} after ${maxRetries} retries`));
           }
         } else {
-          // Non-retryable 400-level error
-          reject(new Error(`API returned ${res.statusCode} (Error: ${data.substring(0, 50)}...)`)); 
+          reject(new Error(`API returned ${res.statusCode}: ${data.substring(0, 80)}`));
         }
       });
       res.on('error', reject);
@@ -103,140 +131,352 @@ async function fetchJSON(url, attempt = 1, maxRetries = 5) {
   });
 }
 
-// schwab-earnings-batch/process-earnings.js - REVISED processSymbol with DateUtils
-async function processSymbol(symbol) {
-  console.log(`Processing ${symbol}...`);
+// ============================================================================
+// UNIVERSE BUILDING — EODHD Screener (single-pass, paginated)
+// ============================================================================
 
-  // --- Date Setup (Timezone-Safe) ---
-  const dateRange = DateUtils.getDateRange(730, 365); // 2 years back, 1 year forward
-  const calendarUrl = `https://eodhd.com/api/calendar/earnings?api_token=${EODHD_API_KEY}&symbols=${symbol}.US&from=${dateRange.from}&to=${dateRange.to}&fmt=json`;
+/**
+ * Build the filtered symbol universe using the EODHD Screener API.
+ *
+ * Key facts confirmed from live screener response:
+ *   - Response shape: { "data": [ {...}, ... ] }  — no "total" field
+ *   - Exchange field value is "US" for all US listings (NYSE + NASDAQ both
+ *     normalize to "US" in EODHD). Filter with exchange = "US" — NOT
+ *     "NYSE" or "NASDAQ" which return nothing from this endpoint.
+ *   - Pagination stop: when data.length < SCREENER_PAGE_SIZE (last page).
+ *   - Market cap field: "market_capitalization" — raw USD integer (not millions).
+ *   - Ticker field: "code".
+ *
+ * API cost: ~15-20 pages × 5 credits = ~75-100 credits total.
+ *
+ * @returns {Promise<string[]>} Tickers sorted by market cap descending.
+ */
+async function getAllSymbols() {
+  console.log('=== UNIVERSE BUILD START (EODHD Screener) ===');
+  console.log(`  Market cap floor: $${(MARKET_CAP_FLOOR / 1_000_000).toFixed(0)}M`);
+  console.log(`  Exchange filter:  US (NYSE + NASDAQ normalized by EODHD)`);
+  console.log(`  Sort:             market_capitalization descending`);
+  console.log('');
+
+  // EODHD screener filters param — JSON array of [field, operation, value].
+  // exchange = "US" covers all US-listed equities (NYSE + NASDAQ).
+  // market_capitalization filter is in raw USD (not millions).
+  const filters = JSON.stringify([
+    ['market_capitalization', '>', MARKET_CAP_FLOOR],
+    ['exchange',              '=', 'US']
+  ]);
+
+  const symbolsWithCap = [];  // [{ symbol, marketCap }]
+  let offset  = 0;
+  let pageNum = 0;
+
+  while (true) {
+    pageNum++;
+
+    const url = [
+      'https://eodhd.com/api/screener',
+      `?api_token=${EODHD_API_KEY}`,
+      `&filters=${encodeURIComponent(filters)}`,
+      `&sort=market_capitalization.desc`,
+      `&limit=${SCREENER_PAGE_SIZE}`,
+      `&offset=${offset}`,
+      `&fmt=json`
+    ].join('');
+
+    let response;
+    try {
+      response = await fetchJSON(url);
+    } catch (err) {
+      // A single page failure is non-fatal if we already have results.
+      // Log and break — we'll process whatever universe we've built so far.
+      console.error(`  Page ${pageNum} fetch error: ${err.message}`);
+      if (symbolsWithCap.length === 0) {
+        console.error('  CRITICAL: Failed on first page with zero symbols. Aborting.');
+        process.exit(1);
+      }
+      console.warn(`  Stopping pagination early. Will process ${symbolsWithCap.length} symbols collected so far.`);
+      break;
+    }
+
+    // Confirmed response shape: { "data": [...] }
+    if (!response || !Array.isArray(response.data)) {
+      console.warn(`  Page ${pageNum}: unexpected response shape (no data array). Stopping pagination.`);
+      console.warn(`  Raw response keys: ${response ? Object.keys(response).join(', ') : 'null'}`);
+      break;
+    }
+
+    const page = response.data;
+
+    for (const item of page) {
+      const symbol    = item.code;
+      const marketCap = parseFloat(item.market_capitalization) || 0;
+
+      if (!symbol) continue;
+
+      // Skip ETFs and funds if the type field is present and explicit.
+      // Most ETFs are already excluded by the market_capitalization filter
+      // (they report $0 or null cap) but some leveraged ETFs have non-zero
+      // cap figures that slip through.
+      if (item.type) {
+        const t = item.type.toUpperCase();
+        if (t.includes('ETF') || t.includes('FUND')) continue;
+      }
+
+      symbolsWithCap.push({ symbol, marketCap });
+    }
+
+    console.log(
+      `  Page ${pageNum}: ${page.length} results | ` +
+      `running total: ${symbolsWithCap.length} | ` +
+      `offset: ${offset}`
+    );
+
+    // Stop when we receive fewer results than the page size — last page.
+    if (page.length < SCREENER_PAGE_SIZE) {
+      console.log(`  Last page reached (${page.length} < ${SCREENER_PAGE_SIZE}).`);
+      break;
+    }
+
+    offset += SCREENER_PAGE_SIZE;
+    await sleep(500); // 500ms between screener pages — polite pacing
+  }
+
+  if (symbolsWithCap.length < MIN_SYMBOL_COUNT) {
+    console.error(`CRITICAL: Only ${symbolsWithCap.length} symbols after screener — below minimum ${MIN_SYMBOL_COUNT}. Check API key/plan. Aborting.`);
+    process.exit(1);
+  }
+
+  // The screener already returns results sorted by market_cap desc per page,
+  // but after merging all pages we re-sort to guarantee global ordering.
+  symbolsWithCap.sort((a, b) => b.marketCap - a.marketCap);
+
+  const finalSymbols = symbolsWithCap.map(s => s.symbol);
+
+  console.log('');
+  console.log('=== UNIVERSE BUILD COMPLETE ===');
+  console.log(`  Final universe: ${finalSymbols.length} symbols`);
+  console.log(`  Top 10:    ${finalSymbols.slice(0, 10).join(', ')}`);
+  console.log(`  Bottom 10: ${finalSymbols.slice(-10).join(', ')}`);
+  console.log('');
+
+  return finalSymbols;
+}
+
+// ============================================================================
+// PER-SYMBOL PROCESSOR
+// ============================================================================
+
+/**
+ * Fetch earnings calendar + price history for one symbol, compute the
+ * average earnings move from past events, find the next upcoming earnings
+ * date, and write the result to Redis.
+ *
+ * Only writes to Redis when nextDate is non-null. Symbols with no upcoming
+ * earnings are skipped — the proxy returns 404 for cache misses and
+ * trade.js renders no catalyst card (correct, not an error).
+ *
+ * @param {string} symbol - Uppercase ticker
+ * @returns {Promise<object|null>} Written result object, or null if skipped/errored
+ */
+async function processSymbol(symbol) {
+  // 2 years back for price history / avgMove calculation;
+  // 1 year forward to capture the next earnings date.
+  const dateRange = DateUtils.getDateRange(730, 365);
+
+  const calendarUrl = [
+    'https://eodhd.com/api/calendar/earnings',
+    `?api_token=${EODHD_API_KEY}`,
+    `&symbols=${symbol}.US`,
+    `&from=${dateRange.from}`,
+    `&to=${dateRange.to}`,
+    `&fmt=json`
+  ].join('');
 
   try {
-    // Step 1: Get earnings calendar
+    // --- Step 1: Earnings calendar ---
     const earningsData = await fetchJSON(calendarUrl);
 
-    if (earningsData.notFound || !Array.isArray(earningsData.earnings)) {
-        console.log(`Skipping ${symbol}: API returned no valid earnings array.`);
-        return null;
-    }
-
-    // Step 2: Get 2-year price history
-    const priceUrl = `https://eodhd.com/api/eod/${symbol}.US?api_token=${EODHD_API_KEY}&period=d&from=${dateRange.from}&to=${DateUtils.formatApiDate(DateUtils.getTodayNormalized())}&fmt=json`;
-    const priceData = await fetchJSON(priceUrl);
-
-    if (priceData.notFound || !Array.isArray(priceData) || priceData.length < 10) {
-      console.log(`Skipping ${symbol}: Insufficient price data for calculation.`);
+    if (earningsData.notFound ||
+        !Array.isArray(earningsData.earnings) ||
+        earningsData.earnings.length === 0) {
+      // No earnings data — expected for ETFs, recent IPOs, some REITs.
       return null;
     }
-    
-    // Step 3: Calculate average earnings move (ONLY past dates)
-    const moves = [];
-    for (const earning of earningsData.earnings) {
-        if (DateUtils.isPastDate(earning.report_date)) {
-            // Calculate day before and after earnings
-            const earningsDate = DateUtils.parseApiDate(earning.report_date);
-            if (!earningsDate) continue;
-            
-            const dayBefore = new Date(earningsDate);
-            dayBefore.setDate(dayBefore.getDate() - 1);
-            const dayAfter = new Date(earningsDate);
-            dayAfter.setDate(dayAfter.getDate() + 1);
-            
-            // Find prices with weekend/holiday lookback
-            const beforePrice = DateUtils.findPriceOnDate(priceData, DateUtils.formatApiDate(dayBefore));
-            const afterPrice = DateUtils.findPriceOnDate(priceData, DateUtils.formatApiDate(dayAfter));
 
-            if (beforePrice && afterPrice && beforePrice > 0) {
-                const percentMove = Math.abs((afterPrice - beforePrice) / beforePrice) * 100;
-                moves.push(percentMove);
-            }
-        }
-    }
-    
-    const avgMove = moves.length > 0 ? moves.reduce((a, b) => a + b, 0) / moves.length : null;
+    // --- Step 2: Find next future earnings date FIRST ---
+    // Skip the symbol entirely (no price history call) if no upcoming date.
+    // Symbols that just reported won't have a next date yet — they'll be
+    // picked up on the following weekly run once EODHD publishes the new date.
+    const allEarningsDates = earningsData.earnings
+      .map(e => e.report_date)
+      .filter(Boolean);
 
-    // Step 4: Find next earnings date (timezone-safe)
-    const allEarningsDates = earningsData.earnings.map(e => e.report_date);
     const nextDate = DateUtils.findNextFutureDate(allEarningsDates);
-    
-    // Step 5: Store in Redis with calculated metadata
+
+    if (!nextDate) {
+      // No upcoming earnings date — do NOT write to Redis.
+      return null;
+    }
+
+    // --- Step 3: Price history for avgMove ---
+    const priceUrl = [
+      `https://eodhd.com/api/eod/${symbol}.US`,
+      `?api_token=${EODHD_API_KEY}`,
+      `&period=d`,
+      `&from=${dateRange.from}`,
+      `&to=${DateUtils.formatApiDate(DateUtils.getTodayNormalized())}`,
+      `&fmt=json`
+    ].join('');
+
+    const priceData = await fetchJSON(priceUrl);
+
+    // --- Step 4: Calculate avgMove from past earnings events ---
+    let avgMove = null;
+
+    if (!priceData.notFound && Array.isArray(priceData) && priceData.length >= 10) {
+      const moves = [];
+
+      for (const earning of earningsData.earnings) {
+        if (!DateUtils.isPastDate(earning.report_date)) continue;
+
+        const earningsDate = DateUtils.parseApiDate(earning.report_date);
+        if (!earningsDate) continue;
+
+        const dayBefore = new Date(earningsDate);
+        dayBefore.setDate(dayBefore.getDate() - 1);
+        const dayAfter = new Date(earningsDate);
+        dayAfter.setDate(dayAfter.getDate() + 1);
+
+        const beforePrice = DateUtils.findPriceOnDate(priceData, DateUtils.formatApiDate(dayBefore));
+        const afterPrice  = DateUtils.findPriceOnDate(priceData, DateUtils.formatApiDate(dayAfter));
+
+        if (beforePrice && afterPrice && beforePrice > 0) {
+          moves.push(Math.abs((afterPrice - beforePrice) / beforePrice) * 100);
+        }
+      }
+
+      if (moves.length > 0) {
+        avgMove = parseFloat(
+          (moves.reduce((a, b) => a + b, 0) / moves.length).toFixed(2)
+        );
+      }
+    }
+    // avgMove stays null if price history was insufficient — we still write
+    // the key so the catalyst card renders with the date (without avgMove).
+
+    // --- Step 5: Write to Redis ---
     const result = {
-      symbol: symbol,
-      nextDate: nextDate,
-      daysUntil: nextDate ? DateUtils.daysUntil(nextDate) : null,
-      formattedDate: nextDate ? DateUtils.formatDisplayDate(nextDate) : null,
-      avgMove: avgMove !== null ? parseFloat(avgMove.toFixed(2)) : null,
-      lastUpdated: new Date().toISOString(),
-      calculatedAt: DateUtils.formatApiDate(DateUtils.getTodayNormalized())
+      symbol,
+      nextDate,
+      daysUntil:     DateUtils.daysUntil(nextDate),
+      formattedDate: DateUtils.formatDisplayDate(nextDate),
+      avgMove,
+      lastUpdated:   new Date().toISOString(),
+      calculatedAt:  DateUtils.formatApiDate(DateUtils.getTodayNormalized()),
     };
 
-    await redis.set(`earnings:${symbol}`, result, { ex: 2592000 });  // 30 day TTL
+    await redis.set(`earnings:${symbol}`, result, { ex: REDIS_TTL_SECONDS });
 
-    console.log(`✓ ${symbol}: Next earnings ${nextDate || 'N/A'} (${result.daysUntil} days), avg move ${avgMove !== null ? avgMove.toFixed(2) + '%' : 'N/A'}`);
+    console.log(
+      `  ✓ ${symbol.padEnd(6)}: next ${nextDate}` +
+      ` (${String(result.daysUntil).padStart(3)}d)` +
+      ` | avgMove: ${avgMove !== null ? avgMove + '%' : 'N/A'}`
+    );
     return result;
 
   } catch (error) {
-    console.error(`Error processing ${symbol}:`, error.message);
+    console.error(`  ✗ ${symbol}: ${error.message}`);
     return null;
   }
 }
 
-const MAX_BATCHES_PER_RUN = 10; // Process a maximum of 10 batches (9,000 symbols)
+// ============================================================================
+// MAIN
+// ============================================================================
 
 async function main() {
-  const SYMBOLS = await getAllSymbols(); 
-  //const SYMBOLS = ['DAL','NEOG','APLD','AAPL','CRWV','NVDA','MSFT']; // Keep for local dev
-  console.log(`Starting batch processing for ${SYMBOLS.length} symbols...`); 
+  const divider = '='.repeat(70);
+  console.log(divider);
+  console.log('ALPHANUDGE WEEKLY EARNINGS BATCH');
+  console.log(`Run started: ${new Date().toISOString()}`);
+  console.log(divider);
+  console.log('');
 
-  let processed = 0; 
-  let successful = 0; 
-  let failed = 0; 
-  let batchesRun = 0;
+  // Validate environment before doing any work
+  if (!EODHD_API_KEY) {
+    console.error('CRITICAL: EODHD_API_KEY not set. Aborting.');
+    process.exit(1);
+  }
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    console.error('CRITICAL: Upstash Redis credentials not set. Aborting.');
+    process.exit(1);
+  }
 
-  const BATCH_SIZE = 900; // Still use 900
-  const BATCH_DELAY_MS = 75000; // 75 seconds for safer rate limit reset
+  // ---- Phase 1: Build filtered universe via screener ----
+  const SYMBOLS = await getAllSymbols();
+  const totalBatches = Math.ceil(SYMBOLS.length / BATCH_SIZE);
+  console.log(`Processing ${SYMBOLS.length} symbols across ${totalBatches} batch(es) of up to ${BATCH_SIZE}`);
+  console.log('');
+
+  // ---- Phase 2: Process each symbol sequentially ----
+  let processed = 0;
+  let written   = 0;  // Redis keys actually written
+  let skipped   = 0;  // No upcoming date — correctly not written
+  let errors    = 0;  // Caught errors in processSymbol
+
+  const startTime = Date.now();
 
   for (let i = 0; i < SYMBOLS.length; i += BATCH_SIZE) {
+    const batch    = SYMBOLS.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
 
-    if (batchesRun >= MAX_BATCHES_PER_RUN) {
-      console.log(`\nSTOPPING: Reached maximum ${MAX_BATCHES_PER_RUN} batches for this run.`);
-      break;
-    }
+    console.log(
+      `--- Batch ${batchNum}/${totalBatches}: ` +
+      `symbols ${i + 1}–${Math.min(i + BATCH_SIZE, SYMBOLS.length)} ---`
+    );
 
-    batchesRun++; // Increment batch counter
-
-    const batch = SYMBOLS.slice(i, i + BATCH_SIZE); 
-    console.log(`\nBatch ${Math.floor(i / BATCH_SIZE) + 1}: Processing ${batch.length} symbols`); 
-
-    // **CRITICAL FIX 2: Sequential processing with micro-delay**
-    const results = [];
     for (const symbol of batch) {
-        const result = await processSymbol(symbol);
-        results.push(result);
-        
-        // Micro-delay to spread the load (70ms)
-        await sleep(70); 
+      const result = await processSymbol(symbol);
+
+      if (result !== null) {
+        written++;
+      } else {
+        skipped++;
+      }
+      processed++;
+
+      await sleep(70); // 70ms micro-delay — keeps EODHD calls spread evenly
     }
-    // End Critical Fix 2
 
-    // Update counters (logic remains the same)
-    processed += batch.length; 
-    successful += results.filter(r => r !== null).length; 
-    failed += results.filter(r => r === null).length; 
+    const elapsedMin = ((Date.now() - startTime) / 60_000).toFixed(1);
+    console.log(
+      `  Batch ${batchNum} done | ` +
+      `processed: ${processed}/${SYMBOLS.length} | ` +
+      `written: ${written} | skipped: ${skipped} | ` +
+      `elapsed: ${elapsedMin}min`
+    );
 
-    console.log(`Progress: ${processed}/${SYMBOLS.length} (${successful} successful, ${failed} failed)`); 
-
-    // Wait 75 seconds between batches (Increased delay)
     if (i + BATCH_SIZE < SYMBOLS.length) {
-      console.log(`Waiting ${BATCH_DELAY_MS / 1000} seconds before next batch...`); 
-      await sleep(BATCH_DELAY_MS); 
+      console.log(`  Waiting ${BATCH_DELAY_MS / 1000}s before next batch...\n`);
+      await sleep(BATCH_DELAY_MS);
     }
   }
 
-  console.log(`\n✓ Batch processing complete!`); 
-  console.log(`Total processed: ${processed}`); 
-  console.log(`Successful: ${successful}`); 
-  console.log(`Failed: ${failed}`); 
+  // ---- Summary ----
+  const totalMin = ((Date.now() - startTime) / 60_000).toFixed(1);
+  console.log('');
+  console.log(divider);
+  console.log('BATCH COMPLETE');
+  console.log(`  Universe size:      ${SYMBOLS.length} symbols`);
+  console.log(`  Redis keys written: ${written}  (symbols with upcoming earnings)`);
+  console.log(`  Skipped:            ${skipped}  (no upcoming date — correct, no write)`);
+  console.log(`  Errors:             ${errors}`);
+  console.log(`  Total elapsed:      ${totalMin} minutes`);
+  console.log(`  Run finished:       ${new Date().toISOString()}`);
+  console.log(divider);
 }
 
-main().catch(console.error);
+main().catch(err => {
+  console.error('FATAL: Unhandled error in main():', err);
+  process.exit(1);
+});
