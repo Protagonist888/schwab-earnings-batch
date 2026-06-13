@@ -14,8 +14,11 @@ name: Keep Alive
 
 on:
   schedule:
-    - cron: '0 12 1 * *'  # 1st of every month at 12:00 UTC
-  workflow_dispatch:        # Allow manual trigger just in case
+    - cron: '0 12 1 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   keep-alive:
@@ -24,7 +27,7 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -34,8 +37,8 @@ jobs:
           git config user.name "GitHub Action"
           echo "Last keep-alive: $(date -u)" > .keep-alive
           git add .keep-alive
-          git commit -m "chore: keep-alive $(date -u '+%Y-%m')"
+          git diff --staged --quiet || git commit -m "chore: keep-alive $(date -u '+%Y-%m')"
           git push
 
       - name: Confirm
-        run: echo "✅ Keep-alive commit pushed — 60-day clock reset"
+        run: echo "Keep-alive commit pushed — 60-day clock reset"
