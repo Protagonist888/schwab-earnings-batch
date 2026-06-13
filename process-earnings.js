@@ -391,6 +391,135 @@ async function processSymbol(symbol) {
 }
 
 // ============================================================================
+// PHASE 3 — PER-SYMBOL EX-DIVIDEND PROCESSOR
+// ============================================================================
+
+/**
+ * Fetch the next upcoming ex-dividend date for one symbol and (only if a date
+ * is found) the matching dividend amount, then write the result to Redis.
+ *
+ * Two-call pattern — Call 2 only fires when Call 1 confirms an upcoming date:
+ *   Call 1 (calendar):          finds the soonest upcoming ex-dividend date.
+ *   Call 2 (corporate actions): fires ONLY when Call 1 found a date; supplies
+ *                               the per-share value, currency, and period.
+ *
+ * Write window is broad (45 days forward) so data is warm in Redis before the
+ * date crosses the 10-day display threshold. The proxy (trade-analysis.js)
+ * enforces the narrow 10-day display window at read time — NOT this batch job.
+ *
+ * dividendPerShare may be null when the corporate-actions endpoint has no
+ * matching record. The Redis write still happens — the proxy and extension
+ * handle null gracefully (show the date, omit the dollar impact).
+ *
+ * Mirrors processSymbol(): same .US suffix, same fetchJSON() error handling,
+ * same REDIS_TTL_SECONDS, same "only write when there is a real catalyst"
+ * discipline (here: only when an upcoming ex-date exists).
+ *
+ * @param {string} symbol - Uppercase ticker
+ * @returns {Promise<object|null>} Written result object, or null if skipped/errored
+ */
+async function processDividendSymbol(symbol) {
+  // Calendar window: today → +45 days (find the soonest upcoming ex-date).
+  // Corporate-actions window: -5 days → +45 days (tolerates feeds that file
+  // the record a few days before/around the ex-date) for the date match.
+  const calRange = DateUtils.getDateRange(0, 45);
+  const caRange  = DateUtils.getDateRange(5, 45);
+
+  // Calendar endpoint uses bracketed filter params; encode the brackets.
+  const calendarUrl = [
+    'https://eodhd.com/api/calendar/dividends',
+    `?api_token=${EODHD_API_KEY}`,
+    `&filter%5Bsymbol%5D=${symbol}.US`,
+    `&filter%5Bdate_from%5D=${calRange.from}`,
+    `&filter%5Bdate_to%5D=${calRange.to}`,
+    `&fmt=json`
+  ].join('');
+
+  try {
+    // --- Call 1: Dividend calendar — find the soonest upcoming ex-date ---
+    const calendarData = await fetchJSON(calendarUrl);
+
+    // Response shape: { data: [ { date: 'YYYY-MM-DD', symbol: 'AAPL.US' }, ... ] }
+    if (calendarData.notFound ||
+        !calendarData.data ||
+        !Array.isArray(calendarData.data) ||
+        calendarData.data.length === 0) {
+      // No upcoming ex-dividend — expected for most symbols in any given week.
+      return null;
+    }
+
+    const exDates = calendarData.data
+      .map(d => d.date)
+      .filter(Boolean);
+
+    const exDividendDate = DateUtils.findNextFutureDate(exDates);
+
+    if (!exDividendDate) {
+      // No upcoming ex-date — do NOT write to Redis.
+      return null;
+    }
+
+    // --- Call 2: Corporate actions — get the per-share amount (ONLY now) ---
+    // Fires only because Call 1 confirmed an upcoming ex-date. In any given
+    // week only a small fraction of the universe qualifies, so this is rare.
+    const corpActionsUrl = [
+      `https://eodhd.com/api/div/${symbol}.US`,
+      `?api_token=${EODHD_API_KEY}`,
+      `&from=${caRange.from}`,
+      `&to=${caRange.to}`,
+      `&fmt=json`
+    ].join('');
+
+    let dividendPerShare = null;
+    let currency = null;
+    let period   = null;
+
+    try {
+      const corpData = await fetchJSON(corpActionsUrl);
+
+      // Response shape: [ { date, value, currency, period, ... }, ... ]
+      // Match on date === the confirmed upcoming ex-dividend date.
+      if (!corpData.notFound && Array.isArray(corpData)) {
+        const match = corpData.find(r => r && r.date === exDividendDate);
+        if (match) {
+          const parsedValue = parseFloat(match.value);
+          dividendPerShare = Number.isFinite(parsedValue) ? parsedValue : null;
+          currency = match.currency || null;
+          period   = match.period  || null;
+        }
+      }
+    } catch (caErr) {
+      // Corporate-actions failure is non-fatal — write the date with null amount.
+      console.error(`  ⚠ ${symbol} dividend amount lookup failed (non-fatal): ${caErr.message}`);
+    }
+
+    // --- Write to Redis (broad 45-day window; proxy filters to 10 at read) ---
+    const result = {
+      symbol,
+      exDividendDate,                              // 'YYYY-MM-DD'
+      daysUntil:       DateUtils.daysUntil(exDividendDate),
+      dividendPerShare,                            // float, or null if no match
+      currency,                                    // e.g. 'USD', or null
+      period,                                      // e.g. 'Quarterly', or null
+      lastUpdated:     new Date().toISOString(),
+    };
+
+    await redis.set(`dividend:${symbol}`, result, { ex: REDIS_TTL_SECONDS });
+
+    console.log(
+      `  ✓ ${symbol.padEnd(6)}: ex-div ${exDividendDate}` +
+      ` (${String(result.daysUntil).padStart(3)}d)` +
+      ` | ${dividendPerShare !== null ? '$' + dividendPerShare + '/sh' : 'amount N/A'}`
+    );
+    return result;
+
+  } catch (error) {
+    console.error(`  ✗ ${symbol} (dividend): ${error.message}`);
+    return null;
+  }
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -472,6 +601,72 @@ async function main() {
   console.log(`  Skipped:            ${skipped}  (no upcoming date — correct, no write)`);
   console.log(`  Errors:             ${errors}`);
   console.log(`  Total elapsed:      ${totalMin} minutes`);
+  console.log(`  Run finished:       ${new Date().toISOString()}`);
+  console.log(divider);
+
+  // ---- Phase 3: Ex-dividend processing (reuses the Phase 1 universe) ----
+  // Runs AFTER the earnings phase completes. Shares the same symbol universe
+  // and infrastructure — one job, one universe build. Each symbol makes at
+  // most 2 EODHD calls, and Call 2 fires only when an upcoming ex-date exists,
+  // so in practice this phase is far lighter than the earnings phase.
+  console.log('');
+  console.log(divider);
+  console.log('PHASE 3 — EX-DIVIDEND PROCESSING');
+  console.log(`  Phase started: ${new Date().toISOString()}`);
+  console.log(divider);
+  console.log('');
+
+  let divProcessed = 0;
+  let divWritten   = 0;  // dividend:{SYMBOL} keys written (upcoming ex-date found)
+  let divSkipped   = 0;  // no upcoming ex-date — correctly not written
+  const divStartTime = Date.now();
+
+  const divTotalBatches = Math.ceil(SYMBOLS.length / BATCH_SIZE);
+
+  for (let i = 0; i < SYMBOLS.length; i += BATCH_SIZE) {
+    const batch    = SYMBOLS.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+
+    console.log(
+      `--- Dividend Batch ${batchNum}/${divTotalBatches}: ` +
+      `symbols ${i + 1}–${Math.min(i + BATCH_SIZE, SYMBOLS.length)} ---`
+    );
+
+    for (const symbol of batch) {
+      const result = await processDividendSymbol(symbol);
+
+      if (result !== null) {
+        divWritten++;
+      } else {
+        divSkipped++;
+      }
+      divProcessed++;
+
+      await sleep(70); // same 70ms micro-delay as the earnings phase
+    }
+
+    const elapsedMin = ((Date.now() - divStartTime) / 60_000).toFixed(1);
+    console.log(
+      `  Dividend Batch ${batchNum} done | ` +
+      `processed: ${divProcessed}/${SYMBOLS.length} | ` +
+      `written: ${divWritten} | skipped: ${divSkipped} | ` +
+      `elapsed: ${elapsedMin}min`
+    );
+
+    if (i + BATCH_SIZE < SYMBOLS.length) {
+      console.log(`  Waiting ${BATCH_DELAY_MS / 1000}s before next dividend batch...\n`);
+      await sleep(BATCH_DELAY_MS);
+    }
+  }
+
+  const divTotalMin = ((Date.now() - divStartTime) / 60_000).toFixed(1);
+  console.log('');
+  console.log(divider);
+  console.log('PHASE 3 COMPLETE');
+  console.log(`  Universe size:      ${SYMBOLS.length} symbols`);
+  console.log(`  Redis keys written: ${divWritten}  (symbols with upcoming ex-dividend)`);
+  console.log(`  Skipped:            ${divSkipped}  (no upcoming ex-date — correct, no write)`);
+  console.log(`  Phase 3 elapsed:    ${divTotalMin} minutes`);
   console.log(`  Run finished:       ${new Date().toISOString()}`);
   console.log(divider);
 }
