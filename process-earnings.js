@@ -74,6 +74,26 @@ const BATCH_DELAY_MS = 75_000;   // 75s between batches
 // Redis TTL: 45 days = two missed-run safety buffers (batch is weekly).
 const REDIS_TTL_SECONDS = 3_888_000;
 
+// Phase 4 (sympathy peers): peers:{SYMBOL} TTL is 7 days (P1A-SYM-5), NOT the
+// 45-day earnings/dividend TTL. Peer sets are recomputed every weekly run, and
+// a 7-day TTL matched to the cadence is the locked decision (an 8-day buffer was
+// flagged but not adopted). Deliberately separate from REDIS_TTL_SECONDS.
+const PEERS_TTL_SECONDS = 604_800;
+
+// Phase 4 peer band: peers must fall within [cap/2.0, cap*2.0] (ratio <= 2.0,
+// P1A-1 Option C). Sector fallback triggers when fewer than this many in-band
+// industry peers survive. Top-N cap on the stored peer list.
+const PEER_CAP_RATIO       = 2.0;
+const PEER_MIN_BEFORE_FALLBACK = 3;   // <3 industry peers -> retry on sector
+const PEER_LIST_MAX        = 8;       // top-8 by market cap descending
+
+// Phase 4 (sympathy peers): full universe metadata captured during the Phase 1
+// screener build ({ symbol, marketCap, sector, industry }). Populated by
+// getAllSymbols() and read only by computePeers(). Kept module-level so Phase 2
+// and Phase 3 keep consuming the plain symbol-string array unchanged — their
+// signatures and behavior are untouched.
+let universeMeta = [];
+
 // Abort if universe is implausibly small (API key issue, plan problem, etc.)
 const MIN_SYMBOL_COUNT = 200;
 
@@ -222,7 +242,18 @@ async function getAllSymbols() {
         if (t.includes('ETF') || t.includes('FUND')) continue;
       }
 
-      symbolsWithCap.push({ symbol, marketCap });
+      // Phase 4 (sympathy peers): capture sector/industry off the SAME screener
+      // rows the earnings universe already pulls — +0 EODHD calls. These fields
+      // are read only by computePeers(); Phase 2/3 ignore the extra properties.
+      // The unfiltered global screen returns these fields per row, so no
+      // per-sector Screener loop (and no two-word `match`-vs-`=` filter trap) is
+      // needed — we never FILTER on sector/industry, only READ the values.
+      const sector   = (typeof item.sector === 'string' && item.sector.trim() !== '')
+        ? item.sector.trim() : null;
+      const industry = (typeof item.industry === 'string' && item.industry.trim() !== '')
+        ? item.industry.trim() : null;
+
+      symbolsWithCap.push({ symbol, marketCap, sector, industry });
     }
 
     console.log(
@@ -252,9 +283,21 @@ async function getAllSymbols() {
 
   const finalSymbols = symbolsWithCap.map(s => s.symbol);
 
+  // Phase 4 (sympathy peers): stash the full sorted universe metadata for
+  // computePeers(). Phase 2/3 still receive `finalSymbols` (plain strings) —
+  // this is a side-channel that changes nothing about the existing return.
+  universeMeta = symbolsWithCap;
+
+  // Quick coverage signal: how many rows actually carried a sector/industry.
+  // If EODHD ever stops returning these on the screener, this surfaces it
+  // loudly rather than silently degrading peer coverage.
+  const withSector   = symbolsWithCap.filter(s => s.sector).length;
+  const withIndustry = symbolsWithCap.filter(s => s.industry).length;
+
   console.log('');
   console.log('=== UNIVERSE BUILD COMPLETE ===');
   console.log(`  Final universe: ${finalSymbols.length} symbols`);
+  console.log(`  With sector:    ${withSector} | with industry: ${withIndustry}`);
   console.log(`  Top 10:    ${finalSymbols.slice(0, 10).join(', ')}`);
   console.log(`  Bottom 10: ${finalSymbols.slice(-10).join(', ')}`);
   console.log('');
@@ -520,6 +563,248 @@ async function processDividendSymbol(symbol) {
 }
 
 // ============================================================================
+// PHASE 4 — SYMPATHY-EARNINGS PEER COMPUTATION
+// ============================================================================
+//
+// Computes, for every in-universe symbol, the set of size-comparable peers in
+// the same industry (fallback: sector) that have an upcoming earnings date, and
+// writes peers:{SYMBOL} to Redis for the extension's sympathy-earnings catalyst.
+//
+// ALL-LOCAL bucketing — ZERO new EODHD calls:
+//   - Sector/industry/marketCap come from `universeMeta`, captured off the SAME
+//     screener rows the Phase 1 earnings universe already pulled (+0 calls).
+//   - Each peer's next earnings date is read back from the earnings:{SYMBOL}
+//     keys Phase 2 just wrote (+0 EODHD calls — Redis reads only).
+//
+// Locked algorithm (P1A-1 Option C; Backend Guide §1.4):
+//   1. Candidate set = universe rows with the SAME industry as S.
+//   2. Cap band: keep peers within [C/2.0, C*2.0]  (PEER_CAP_RATIO).
+//   3. If < PEER_MIN_BEFORE_FALLBACK (3) survive, rebuild on SAME sector and
+//      re-apply the cap band. Record matchLevel ("industry" | "sector").
+//   4. Exclude S itself.
+//   5. Sort by market cap descending; take top PEER_LIST_MAX (8).
+//   6. Join each peer's next earnings date from earnings:{SYMBOL} (Redis).
+//   7. Drop peers with no upcoming earnings date. Then:
+//        - >=1 peer with an upcoming date  -> write full block (qualified:true).
+//        - structurally peerless (0 peers even after sector fallback, excluding
+//          self)                            -> CASE 1: write {qualified:true,
+//                                              peers:[]} (the note fires).
+//        - has comparable peers but none reporting soon -> write NO key
+//          (silent; NOT case 1 — comparable peers exist, just no imminent
+//          catalyst). Distinguishing these two empties is a deliberate decision
+//          (confirmed 2026-07-08): the "no comparable peers" note must only fire
+//          when there are genuinely no comparable peers, never when peers exist
+//          but happen to have no upcoming earnings.
+//
+// Redis value shape (authoritative — proxy/extension depend on it; Guide §1.6):
+//   peers:{SYMBOL} = {
+//     symbol, qualified: true, matchLevel: "industry"|"sector",
+//     peers: [ { symbol, name, marketCap, nextEarningsDate }, ... up to 8 ],
+//     computedAt
+//   }
+// TTL: PEERS_TTL_SECONDS (7 days). Peer ordering here is market-cap desc (top-8
+// selection); the EXTENSION re-orders soonest-earnings-first for display.
+
+/**
+ * Build an in-memory index of the universe by industry and by sector, plus a
+ * per-symbol metadata lookup. Done once, reused for every symbol's bucketing.
+ *
+ * @param {Array<{symbol,marketCap,sector,industry}>} meta
+ * @returns {{ byIndustry: Map<string,Array>, bySector: Map<string,Array>, bySymbol: Map<string,object> }}
+ */
+function buildUniverseIndex(meta) {
+  const byIndustry = new Map();
+  const bySector   = new Map();
+  const bySymbol   = new Map();
+
+  for (const row of meta) {
+    if (!row || typeof row.symbol !== 'string') continue;
+    bySymbol.set(row.symbol, row);
+
+    if (row.industry) {
+      if (!byIndustry.has(row.industry)) byIndustry.set(row.industry, []);
+      byIndustry.get(row.industry).push(row);
+    }
+    if (row.sector) {
+      if (!bySector.has(row.sector)) bySector.set(row.sector, []);
+      bySector.get(row.sector).push(row);
+    }
+  }
+
+  return { byIndustry, bySector, bySymbol };
+}
+
+/**
+ * Apply the cap band and exclude the traded symbol.
+ * Keeps candidates whose marketCap is within [C/ratio, C*ratio] and > 0.
+ *
+ * @param {Array<{symbol,marketCap}>} candidates
+ * @param {string} selfSymbol
+ * @param {number} C   traded symbol's market cap (> 0)
+ * @returns {Array} in-band candidates, self excluded
+ */
+function applyCapBand(candidates, selfSymbol, C) {
+  const lo = C / PEER_CAP_RATIO;
+  const hi = C * PEER_CAP_RATIO;
+  return candidates.filter(row =>
+    row.symbol !== selfSymbol &&
+    row.marketCap > 0 &&
+    row.marketCap >= lo &&
+    row.marketCap <= hi
+  );
+}
+
+/**
+ * Compute the peer bucket for a single symbol using the pre-built index.
+ * Pure/local — no I/O. Returns the structural peer set (before the earnings
+ * join) plus the matchLevel, or a structurally-peerless marker.
+ *
+ * @returns {{ matchLevel: 'industry'|'sector'|null, peers: Array }}
+ *   peers is the top-8 in-band structural peer rows (market-cap desc), self
+ *   excluded. Empty array => structurally peerless (case-1 candidate).
+ */
+function computeStructuralPeers(row, index) {
+  const C = row.marketCap;
+  // No usable cap or no classification => cannot bucket. Treat as peerless.
+  if (!(C > 0) || (!row.industry && !row.sector)) {
+    return { matchLevel: null, peers: [] };
+  }
+
+  let matchLevel = null;
+  let inBand = [];
+
+  // Step 1-2: industry candidates within the cap band.
+  if (row.industry && index.byIndustry.has(row.industry)) {
+    inBand = applyCapBand(index.byIndustry.get(row.industry), row.symbol, C);
+    matchLevel = 'industry';
+  }
+
+  // Step 3: sector fallback when fewer than the threshold survive.
+  if (inBand.length < PEER_MIN_BEFORE_FALLBACK && row.sector && index.bySector.has(row.sector)) {
+    const sectorBand = applyCapBand(index.bySector.get(row.sector), row.symbol, C);
+    // Only adopt the sector set when it STRICTLY improves coverage (more peers).
+    // On a tie, keep the finer industry match — the sector set is a superset of
+    // the industry set, so equal counts mean the industry peers were the only
+    // ones in-band anyway, and "industry" is the more precise matchLevel to
+    // report. This also avoids mislabeling a genuine industry match as sector.
+    if (sectorBand.length > inBand.length) {
+      inBand = sectorBand;
+      matchLevel = 'sector';
+    }
+  }
+
+  // Step 4 (self-exclusion) already handled in applyCapBand.
+  // Step 5: sort market-cap desc, take top-8.
+  inBand.sort((a, b) => b.marketCap - a.marketCap);
+  const top = inBand.slice(0, PEER_LIST_MAX);
+
+  return { matchLevel: top.length > 0 ? matchLevel : null, peers: top };
+}
+
+/**
+ * Read a peer's upcoming earnings date from the earnings:{SYMBOL} key Phase 2
+ * wrote. Returns a normalized "YYYY-MM-DD" upcoming date, or null when there is
+ * no key, no nextDate, or the date is not in the future. Non-fatal on error.
+ *
+ * @param {string} peerSymbol
+ * @returns {Promise<string|null>}
+ */
+async function getPeerNextEarningsDate(peerSymbol) {
+  try {
+    const cached = await redis.get(`earnings:${peerSymbol}`);
+    if (!cached || typeof cached !== 'object') return null;
+
+    const nextDate = cached.nextDate;
+    if (!DateUtils.isValidDateFormat(nextDate)) return null;
+
+    // Re-validate freshness at compute time — the cached daysUntil can be stale.
+    // Keep only genuinely upcoming dates (today or later). Past dates mean the
+    // peer already reported; it is not an upcoming sympathy catalyst.
+    const d = DateUtils.daysUntil(nextDate);
+    if (d === null || d < 0) return null;
+
+    return nextDate;
+  } catch (err) {
+    console.error(`  ⚠ peer earnings read failed for ${peerSymbol} (non-fatal): ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * Compute + write peers:{SYMBOL} for one symbol. Reuses the pre-built universe
+ * index (structural peers) and reads earnings:{SYMBOL} for each peer's date.
+ *
+ * @param {{symbol,marketCap,sector,industry}} row  traded symbol's universe row
+ * @param {object} index  output of buildUniverseIndex()
+ * @returns {Promise<'written'|'case1'|'skipped'|'error'>}
+ */
+async function processPeerSymbol(row, index) {
+  const symbol = row.symbol;
+  try {
+    const { matchLevel, peers: structuralPeers } = computeStructuralPeers(row, index);
+
+    // CASE 1: structurally peerless — no comparable peers even after fallback.
+    // Write an explicit qualified-but-empty block so the extension shows the
+    // "no comparable peers" note. This is the meaningful empty.
+    if (structuralPeers.length === 0) {
+      const case1 = {
+        symbol,
+        qualified: true,
+        matchLevel: null,
+        peers: [],
+        computedAt: new Date().toISOString(),
+      };
+      await redis.set(`peers:${symbol}`, case1, { ex: PEERS_TTL_SECONDS });
+      console.log(`  ○ ${symbol.padEnd(6)}: case-1 (no comparable peers) — qualified:[] written`);
+      return 'case1';
+    }
+
+    // Step 6-7: join each structural peer's upcoming earnings date (Redis read),
+    // dropping peers with no upcoming date. Sequential to stay well under any
+    // Upstash rate ceiling; the structural set is <= 8, so this is cheap.
+    const peersWithEarnings = [];
+    for (const peer of structuralPeers) {
+      const nextEarningsDate = await getPeerNextEarningsDate(peer.symbol);
+      if (!nextEarningsDate) continue;
+      peersWithEarnings.push({
+        symbol: peer.symbol,
+        name: peer.symbol,             // screener rows carry no company name; use ticker
+        marketCap: peer.marketCap,
+        nextEarningsDate,              // "YYYY-MM-DD"; extension re-validates + orders
+      });
+    }
+
+    // Has comparable peers but NONE reporting soon -> no key (silent). NOT case
+    // 1: comparable peers exist, they just have no imminent catalyst. Writing an
+    // empty-qualified block here would misfire the "no comparable peers" note.
+    if (peersWithEarnings.length === 0) {
+      return 'skipped';
+    }
+
+    // >=1 peer with an upcoming earnings date -> write the full block.
+    const result = {
+      symbol,
+      qualified: true,
+      matchLevel: matchLevel || null,
+      peers: peersWithEarnings,        // market-cap desc; extension re-orders soonest-first
+      computedAt: new Date().toISOString(),
+    };
+    await redis.set(`peers:${symbol}`, result, { ex: PEERS_TTL_SECONDS });
+
+    console.log(
+      `  ✓ ${symbol.padEnd(6)}: ${peersWithEarnings.length} peer(s)` +
+      ` [${matchLevel}]` +
+      ` | nearest ${peersWithEarnings.map(p => p.nextEarningsDate).sort()[0]}`
+    );
+    return 'written';
+
+  } catch (error) {
+    console.error(`  ✗ ${symbol} (peers): ${error.message}`);
+    return 'error';
+  }
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
@@ -667,6 +952,90 @@ async function main() {
   console.log(`  Redis keys written: ${divWritten}  (symbols with upcoming ex-dividend)`);
   console.log(`  Skipped:            ${divSkipped}  (no upcoming ex-date — correct, no write)`);
   console.log(`  Phase 3 elapsed:    ${divTotalMin} minutes`);
+  console.log(`  Run finished:       ${new Date().toISOString()}`);
+  console.log(divider);
+
+  // ---- Phase 4: Sympathy-earnings peer computation (reuses Phase 1 universe) ----
+  // Runs AFTER Phase 2, because it reads back the earnings:{SYMBOL} keys Phase 2
+  // wrote to join each peer's next earnings date. ALL-LOCAL bucketing off
+  // `universeMeta` (captured during the Phase 1 screener build) + Redis reads of
+  // already-written earnings keys — ZERO new EODHD calls for the whole phase.
+  console.log('');
+  console.log(divider);
+  console.log('PHASE 4 — SYMPATHY-EARNINGS PEER COMPUTATION');
+  console.log(`  Phase started: ${new Date().toISOString()}`);
+  console.log(divider);
+  console.log('');
+
+  // Guard: universeMeta must be populated with sector/industry. If it is empty
+  // (screener stopped returning classification, or an upstream change), skip the
+  // phase loudly rather than writing garbage / empty peer keys everywhere.
+  if (!Array.isArray(universeMeta) || universeMeta.length === 0) {
+    console.error('  Phase 4 SKIPPED: universeMeta is empty — no sector/industry captured. Peers not computed.');
+    console.log(divider);
+    return;
+  }
+
+  const peerIndex = buildUniverseIndex(universeMeta);
+  console.log(
+    `  Universe index built: ${peerIndex.byIndustry.size} industries, ` +
+    `${peerIndex.bySector.size} sectors, ${peerIndex.bySymbol.size} symbols`
+  );
+  console.log('');
+
+  let peerProcessed = 0;
+  let peerWritten   = 0;  // full peers:{SYMBOL} blocks written (>=1 peer reporting)
+  let peerCase1     = 0;  // qualified-but-empty blocks (structurally peerless)
+  let peerSkipped   = 0;  // has comparable peers but none reporting — no key
+  let peerErrors    = 0;
+  const peerStartTime = Date.now();
+
+  const peerTotalBatches = Math.ceil(universeMeta.length / BATCH_SIZE);
+
+  for (let i = 0; i < universeMeta.length; i += BATCH_SIZE) {
+    const batch    = universeMeta.slice(i, i + BATCH_SIZE);
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+
+    console.log(
+      `--- Peer Batch ${batchNum}/${peerTotalBatches}: ` +
+      `symbols ${i + 1}–${Math.min(i + BATCH_SIZE, universeMeta.length)} ---`
+    );
+
+    for (const row of batch) {
+      const outcome = await processPeerSymbol(row, peerIndex);
+      if      (outcome === 'written') peerWritten++;
+      else if (outcome === 'case1')   peerCase1++;
+      else if (outcome === 'skipped') peerSkipped++;
+      else                            peerErrors++;
+      peerProcessed++;
+
+      // Light micro-delay: Phase 4 is Redis-only (no EODHD), but each symbol
+      // does up to 8 reads + 1 write. 20ms keeps well under Upstash limits
+      // without the 75s EODHD inter-batch waits the other phases need.
+      await sleep(20);
+    }
+
+    const elapsedMin = ((Date.now() - peerStartTime) / 60_000).toFixed(1);
+    console.log(
+      `  Peer Batch ${batchNum} done | ` +
+      `processed: ${peerProcessed}/${universeMeta.length} | ` +
+      `written: ${peerWritten} | case1: ${peerCase1} | ` +
+      `skipped: ${peerSkipped} | errors: ${peerErrors} | ` +
+      `elapsed: ${elapsedMin}min`
+    );
+    // No EODHD inter-batch delay — Phase 4 makes no live external calls.
+  }
+
+  const peerTotalMin = ((Date.now() - peerStartTime) / 60_000).toFixed(1);
+  console.log('');
+  console.log(divider);
+  console.log('PHASE 4 COMPLETE');
+  console.log(`  Universe size:      ${universeMeta.length} symbols`);
+  console.log(`  Peer blocks written:${peerWritten}  (>=1 comparable peer reporting soon)`);
+  console.log(`  Case-1 (peerless):  ${peerCase1}  (qualified:[] — "no comparable peers" note)`);
+  console.log(`  Skipped (no key):   ${peerSkipped}  (peers exist but none reporting — correct silence)`);
+  console.log(`  Errors:             ${peerErrors}`);
+  console.log(`  Phase 4 elapsed:    ${peerTotalMin} minutes`);
   console.log(`  Run finished:       ${new Date().toISOString()}`);
   console.log(divider);
 }
