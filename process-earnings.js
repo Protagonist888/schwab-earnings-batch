@@ -111,6 +111,90 @@ const PEERS_TTL_SECONDS = 604_800;
 const PEER_CAP_RATIO       = 3.0;
 const PEER_LIST_MAX        = 8;       // max peers stored per symbol
 
+// ---------------------------------------------------------------------------
+// FINDING A — non-common-equity share lines must never appear as peers.
+//
+// Observed in production (2026-07-11): a JPM sympathy card listed BAC, JPM-PC,
+// and JPM-PD as "peers". JPM-PC and JPM-PD are JPMorgan's own PREFERRED share
+// series — i.e. the traded company itself. The card told the user that JPM's
+// earnings might move JPM in sympathy. Circular, and visibly broken.
+//
+// The old self-exclusion in applyCapBand compared the exact symbol string
+// (row.symbol !== selfSymbol), so "JPM-PC" !== "JPM" passed straight through.
+//
+// TWO INDEPENDENT DEFENSES (deliberate; they fail differently):
+//
+//   1. UNIVERSE FILTER (getAllSymbols): drop non-common-equity lines outright.
+//      Preferred shares, warrants, rights and units do NOT trade on earnings
+//      the way common stock does — a preferred line is a fixed-income-like
+//      instrument whose price is driven by rates and credit, not by the
+//      quarterly print. It is a bad sympathy peer for ANY symbol, not just its
+//      own issuer. This is the broad fix.
+//
+//   2. ISSUER-ROOT SELF-EXCLUSION (applyCapBand): never let a candidate that
+//      shares the traded symbol's ISSUER ROOT be its own peer, even if it
+//      survived (1). This catches legitimate multi-class COMMON lines, which
+//      (1) intentionally does NOT drop — e.g. BRK-A/BRK-B, GOOG/GOOGL are real
+//      common shares of one issuer, and must not be peers of each other.
+//
+// Suffix conventions vary by vendor; EODHD/Schwab US lines use a hyphen:
+//   PREFERRED : JPM-PC, JPM-PD, BAC-PB, WFC-PL   (root + "-P" + series letter)
+//   WARRANT   : ABC-WT, ABC-W
+//   RIGHT     : ABC-R      UNIT: ABC-U
+//   CLASS     : BRK-A, BRK-B                     (COMMON — kept by (1), caught by (2))
+// Some feeds use "." instead ("BRK.B"); both separators are handled.
+// ---------------------------------------------------------------------------
+
+// Suffixes that denote a NON-common-equity line. Class suffixes (A/B/C) are
+// deliberately ABSENT: those are real common shares and are handled by the
+// issuer-root rule instead, not by dropping them from the universe.
+const NON_COMMON_SUFFIXES = new Set([
+  'P',                                      // preferred (bare)
+  'PA','PB','PC','PD','PE','PF','PG','PH',  // preferred, series A-P
+  'PI','PJ','PK','PL','PM','PN','PO','PP',
+  'PQ','PR','PS','PT','PU','PV','PW','PX','PY','PZ',
+  'W','WT','WS',                            // warrants
+  'R','RT',                                 // rights
+  'U','UN',                                 // units
+]);
+
+/**
+ * Split a ticker into its issuer root and suffix.
+ * "JPM-PC" -> { root: "JPM", suffix: "PC" };  "BRK.B" -> { root: "BRK", suffix: "B" }
+ * "JPM"    -> { root: "JPM", suffix: null }
+ *
+ * Only the FIRST separator is honored, and only when a non-empty root precedes
+ * it, so an oddly-formed symbol degrades to root=itself rather than throwing.
+ *
+ * @param {string} symbol
+ * @returns {{root: string, suffix: ?string}}
+ */
+function splitTicker(symbol) {
+  if (typeof symbol !== 'string' || symbol === '') {
+    return { root: '', suffix: null };
+  }
+  const m = symbol.match(/^([^-.]+)[-.](.+)$/);
+  if (!m) {
+    return { root: symbol.toUpperCase(), suffix: null };
+  }
+  return { root: m[1].toUpperCase(), suffix: m[2].toUpperCase() };
+}
+
+/**
+ * True when a ticker denotes a NON-common-equity line (preferred, warrant,
+ * right, unit) that should never enter the peer universe. Multi-class COMMON
+ * lines (BRK-A, BRK-B) return FALSE — they are real common shares and are
+ * excluded from their own issuer's peer list by the issuer-root rule instead.
+ *
+ * @param {string} symbol
+ * @returns {boolean}
+ */
+function isNonCommonEquity(symbol) {
+  const { suffix } = splitTicker(symbol);
+  if (!suffix) return false;
+  return NON_COMMON_SUFFIXES.has(suffix);
+}
+
 // Phase 4 (sympathy peers): full universe metadata captured during the Phase 1
 // screener build ({ symbol, marketCap, sector, industry }). Populated by
 // getAllSymbols() and read only by computePeers(). Kept module-level so Phase 2
@@ -210,7 +294,8 @@ async function getAllSymbols() {
     ['exchange',              '=', 'US']
   ]);
 
-  const symbolsWithCap = [];  // [{ symbol, marketCap }]
+  const symbolsWithCap = [];  // [{ symbol, marketCap, sector, industry }]
+  let nonCommonSkipped = 0;   // Finding A: preferred/warrant/right/unit lines dropped
   let offset  = 0;
   let pageNum = 0;
 
@@ -264,6 +349,23 @@ async function getAllSymbols() {
       if (item.type) {
         const t = item.type.toUpperCase();
         if (t.includes('ETF') || t.includes('FUND')) continue;
+      }
+
+      // FINDING A, defense 1 — drop NON-COMMON-EQUITY lines (preferred shares,
+      // warrants, rights, units). Two reasons:
+      //   (i) They are not sympathy peers for ANYONE. A preferred line such as
+      //       JPM-PC behaves like fixed income — priced off rates and credit,
+      //       not off the quarterly earnings print — so it cannot "move in
+      //       sympathy" with a peer's earnings in the way common stock does.
+      //  (ii) Observed in production: JPM's peer card listed JPM-PC and JPM-PD,
+      //       i.e. the traded company itself, because the old self-exclusion
+      //       compared exact symbol strings.
+      // Multi-class COMMON lines (BRK-A, BRK-B) are deliberately NOT dropped
+      // here — they are genuine common shares. They are prevented from being
+      // peers of their own issuer by the issuer-root rule in applyCapBand.
+      if (isNonCommonEquity(symbol)) {
+        nonCommonSkipped++;
+        continue;
       }
 
       // Phase 4 (sympathy peers): capture sector/industry off the SAME screener
@@ -322,6 +424,7 @@ async function getAllSymbols() {
   console.log('=== UNIVERSE BUILD COMPLETE ===');
   console.log(`  Final universe: ${finalSymbols.length} symbols`);
   console.log(`  With sector:    ${withSector} | with industry: ${withIndustry}`);
+  console.log(`  Non-common lines skipped (pref/warrant/right/unit): ${nonCommonSkipped}`);
   console.log(`  Top 10:    ${finalSymbols.slice(0, 10).join(', ')}`);
   console.log(`  Bottom 10: ${finalSymbols.slice(-10).join(', ')}`);
   console.log('');
@@ -671,19 +774,29 @@ function buildUniverseIndex(meta) {
 }
 
 /**
- * Apply the cap band and exclude the traded symbol.
+ * Apply the cap band and exclude EVERY share line of the traded issuer.
  * Keeps candidates whose marketCap is within [C/ratio, C*ratio] and > 0.
+ *
+ * FINDING A, defense 2 — the exclusion is by ISSUER ROOT, not exact string.
  *
  * @param {Array<{symbol,marketCap}>} candidates
  * @param {string} selfSymbol
  * @param {number} C   traded symbol's market cap (> 0)
- * @returns {Array} in-band candidates, self excluded
+ * @returns {Array} in-band candidates, all lines of self excluded
  */
 function applyCapBand(candidates, selfSymbol, C) {
   const lo = C / PEER_CAP_RATIO;
   const hi = C * PEER_CAP_RATIO;
+
+  // ISSUER-ROOT self-exclusion. The old test was `row.symbol !== selfSymbol`,
+  // which let JPM-PC and JPM-PD through as "peers" of JPM ("JPM-PC" !== "JPM"
+  // is true). Comparing ISSUER ROOTS excludes every share line of the traded
+  // issuer — preferred, warrant, or a second common class (BRK-A vs BRK-B).
+  // A company can never be its own sympathy peer.
+  const selfRoot = splitTicker(selfSymbol).root;
+
   return candidates.filter(row =>
-    row.symbol !== selfSymbol &&
+    splitTicker(row.symbol).root !== selfRoot &&
     row.marketCap > 0 &&
     row.marketCap >= lo &&
     row.marketCap <= hi
