@@ -80,12 +80,36 @@ const REDIS_TTL_SECONDS = 3_888_000;
 // flagged but not adopted). Deliberately separate from REDIS_TTL_SECONDS.
 const PEERS_TTL_SECONDS = 604_800;
 
-// Phase 4 peer band: peers must fall within [cap/2.0, cap*2.0] (ratio <= 2.0,
-// P1A-1 Option C). Sector fallback triggers when fewer than this many in-band
-// industry peers survive. Top-N cap on the stored peer list.
-const PEER_CAP_RATIO       = 2.0;
-const PEER_MIN_BEFORE_FALLBACK = 3;   // <3 industry peers -> retry on sector
-const PEER_LIST_MAX        = 8;       // top-8 by market cap descending
+// Phase 4 peer band: peers must fall within [cap/RATIO, cap*RATIO].
+//
+// FINDING B RESOLUTION — INDUSTRY-ONLY PEERS (supersedes P1A-1 Option C).
+// The sector fallback has been REMOVED. It was the sole source of false sympathy
+// signals: when a symbol's industry was thin, the old code rebuilt the candidate
+// set on the whole SECTOR, which admitted large, business-unrelated same-sector
+// names (e.g. for UAL/Airlines it surfaced MMM, Mitsubishi, Itochu, Emerson from
+// the Industrials sector). Those peers do not co-move with the traded symbol, so
+// a "peer reports soon" card built on them is actively misleading. Coverage
+// bought with false signals is negative value.
+//
+// Peers are now ALWAYS same-industry. To recover the coverage the fallback used
+// to provide, the cap band is widened 2.0x -> 3.0x. This admits genuinely-related
+// smaller/larger names from the SAME industry (e.g. LUV ~$20B now qualifies for
+// UAL ~$42B) instead of unrelated same-size names from a different industry. A
+// smaller airline is a far better sympathy proxy for an airline than an
+// identically-sized conglomerate.
+//
+// Symbols with zero in-band same-industry peers now correctly fall to CASE 1
+// ("no comparable peers"), which the extension already renders gracefully via
+// peerComparisonNote. Going dark honestly beats showing a wrong peer.
+//
+// FUTURE (paid tier): EODHD Fundamentals exposes GICS (GicSector/GicGroup/
+// GicIndustry/GicSubIndustry), enabling a graduated relaxation ladder
+// (sub-industry -> industry -> industry group) instead of this single flat
+// industry match, plus correlation-ranked peer selection. Deferred: Fundamentals
+// is a per-symbol call and would roughly double API cost. The flat screener
+// `industry` string is sufficient for the industry-only design and costs $0.
+const PEER_CAP_RATIO       = 3.0;
+const PEER_LIST_MAX        = 8;       // max peers stored per symbol
 
 // Phase 4 (sympathy peers): full universe metadata captured during the Phase 1
 // screener build ({ symbol, marketCap, sector, industry }). Populated by
@@ -567,8 +591,8 @@ async function processDividendSymbol(symbol) {
 // ============================================================================
 //
 // Computes, for every in-universe symbol, the set of size-comparable peers in
-// the same industry (fallback: sector) that have an upcoming earnings date, and
-// writes peers:{SYMBOL} to Redis for the extension's sympathy-earnings catalyst.
+// the SAME INDUSTRY that have an upcoming earnings date, and writes
+// peers:{SYMBOL} to Redis for the extension's sympathy-earnings catalyst.
 //
 // ALL-LOCAL bucketing — ZERO new EODHD calls:
 //   - Sector/industry/marketCap come from `universeMeta`, captured off the SAME
@@ -576,19 +600,26 @@ async function processDividendSymbol(symbol) {
 //   - Each peer's next earnings date is read back from the earnings:{SYMBOL}
 //     keys Phase 2 just wrote (+0 EODHD calls — Redis reads only).
 //
-// Locked algorithm (P1A-1 Option C; Backend Guide §1.4):
-//   1. Candidate set = universe rows with the SAME industry as S.
-//   2. Cap band: keep peers within [C/2.0, C*2.0]  (PEER_CAP_RATIO).
-//   3. If < PEER_MIN_BEFORE_FALLBACK (3) survive, rebuild on SAME sector and
-//      re-apply the cap band. Record matchLevel ("industry" | "sector").
-//   4. Exclude S itself.
-//   5. Sort by market cap descending; take top PEER_LIST_MAX (8).
-//   6. Join each peer's next earnings date from earnings:{SYMBOL} (Redis).
-//   7. Drop peers with no upcoming earnings date. Then:
+// Algorithm (INDUSTRY-ONLY — supersedes P1A-1 Option C / Backend Guide §1.4;
+// see the PEER_CAP_RATIO comment for the Finding B rationale):
+//   1. Candidate set = universe rows with the SAME industry as S. Industry is
+//      MANDATORY — a symbol with no industry is peerless. There is NO sector
+//      fallback (removed: it admitted business-unrelated same-sector names).
+//   2. Cap band: keep peers within [C/3.0, C*3.0]  (PEER_CAP_RATIO, widened from
+//      2.0 to recover the coverage the sector fallback used to provide — but
+//      from the RIGHT pool: same-industry names).
+//   3. Exclude S itself.
+//   4. Sort by market cap descending; take top PEER_LIST_MAX (8). Market cap is
+//      the SELECTION criterion (bigger same-industry names are more material
+//      movers).
+//   5. Join each peer's next earnings date from earnings:{SYMBOL} (Redis).
+//   6. Drop peers with no upcoming earnings date.
+//   7. Re-sort survivors SOONEST-EARNINGS FIRST, market-cap desc as tiebreaker
+//      (catalyst proximity is what makes a peer actionable). Then:
 //        - >=1 peer with an upcoming date  -> write full block (qualified:true).
-//        - structurally peerless (0 peers even after sector fallback, excluding
-//          self)                            -> CASE 1: write {qualified:true,
-//                                              peers:[]} (the note fires).
+//        - structurally peerless (0 in-band same-industry peers, excluding self)
+//                                          -> CASE 1: write {qualified:true,
+//                                             peers:[]} (the note fires).
 //        - has comparable peers but none reporting soon -> write NO key
 //          (silent; NOT case 1 — comparable peers exist, just no imminent
 //          catalyst). Distinguishing these two empties is a deliberate decision
@@ -598,12 +629,17 @@ async function processDividendSymbol(symbol) {
 //
 // Redis value shape (authoritative — proxy/extension depend on it; Guide §1.6):
 //   peers:{SYMBOL} = {
-//     symbol, qualified: true, matchLevel: "industry"|"sector",
+//     symbol, qualified: true, matchLevel: "industry",   // "sector" NO LONGER EMITTED
 //     peers: [ { symbol, name, marketCap, nextEarningsDate }, ... up to 8 ],
 //     computedAt
 //   }
-// TTL: PEERS_TTL_SECONDS (7 days). Peer ordering here is market-cap desc (top-8
-// selection); the EXTENSION re-orders soonest-earnings-first for display.
+// TTL: PEERS_TTL_SECONDS (7 days). Peer ordering as STORED is soonest-earnings
+// first (market-cap desc tiebreak); the extension applies the identical ordering
+// client-side after re-validating each date, so the two never disagree.
+//
+// SCHEMA NOTE: matchLevel remains in the shape for compatibility, but is now
+// always "industry" (or null when peerless). Consumers must not assume "sector"
+// can appear. The extension treats matchLevel as bag-internal (not displayed).
 
 /**
  * Build an in-memory index of the universe by industry and by sector, plus a
@@ -665,40 +701,42 @@ function applyCapBand(candidates, selfSymbol, C) {
  */
 function computeStructuralPeers(row, index) {
   const C = row.marketCap;
-  // No usable cap or no classification => cannot bucket. Treat as peerless.
-  if (!(C > 0) || (!row.industry && !row.sector)) {
+
+  // No usable cap, or no INDUSTRY classification => cannot bucket. Treat as
+  // peerless. NOTE: `sector` alone is no longer sufficient to bucket a symbol —
+  // industry is now mandatory, because sector-level peers are exactly the noise
+  // this design removes. A symbol with a sector but no industry is peerless.
+  if (!(C > 0) || !row.industry) {
     return { matchLevel: null, peers: [] };
   }
 
-  let matchLevel = null;
-  let inBand = [];
-
-  // Step 1-2: industry candidates within the cap band.
-  if (row.industry && index.byIndustry.has(row.industry)) {
-    inBand = applyCapBand(index.byIndustry.get(row.industry), row.symbol, C);
-    matchLevel = 'industry';
+  if (!index.byIndustry.has(row.industry)) {
+    return { matchLevel: null, peers: [] };
   }
 
-  // Step 3: sector fallback when fewer than the threshold survive.
-  if (inBand.length < PEER_MIN_BEFORE_FALLBACK && row.sector && index.bySector.has(row.sector)) {
-    const sectorBand = applyCapBand(index.bySector.get(row.sector), row.symbol, C);
-    // Only adopt the sector set when it STRICTLY improves coverage (more peers).
-    // On a tie, keep the finer industry match — the sector set is a superset of
-    // the industry set, so equal counts mean the industry peers were the only
-    // ones in-band anyway, and "industry" is the more precise matchLevel to
-    // report. This also avoids mislabeling a genuine industry match as sector.
-    if (sectorBand.length > inBand.length) {
-      inBand = sectorBand;
-      matchLevel = 'sector';
-    }
+  // Same-industry candidates within the (now 3.0x) cap band. Self-exclusion and
+  // the marketCap > 0 guard are handled inside applyCapBand.
+  const inBand = applyCapBand(index.byIndustry.get(row.industry), row.symbol, C);
+
+  if (inBand.length === 0) {
+    // Structurally peerless: no same-industry name survives the band. This is a
+    // CASE 1 candidate — the extension shows "no comparable peers". We do NOT
+    // fall back to sector; a wrong peer is worse than no peer.
+    return { matchLevel: null, peers: [] };
   }
 
-  // Step 4 (self-exclusion) already handled in applyCapBand.
-  // Step 5: sort market-cap desc, take top-8.
+  // Trim to the top PEER_LIST_MAX by market cap descending. Market cap is the
+  // right SELECTION criterion (bigger same-industry names are the more material
+  // sympathy movers), even though the stored/display ORDER is soonest-earnings
+  // first — that ordering is applied later, in processPeerSymbol(), once each
+  // peer's earnings date is known.
   inBand.sort((a, b) => b.marketCap - a.marketCap);
   const top = inBand.slice(0, PEER_LIST_MAX);
 
-  return { matchLevel: top.length > 0 ? matchLevel : null, peers: top };
+  // matchLevel is always "industry" now (or null when peerless). Retained in the
+  // stored block for schema compatibility and analytics; the extension treats it
+  // as bag-internal.
+  return { matchLevel: 'industry', peers: top };
 }
 
 /**
@@ -781,12 +819,27 @@ async function processPeerSymbol(row, index) {
       return 'skipped';
     }
 
+    // ORDERING: soonest-earnings first, market-cap DESC as the tiebreaker.
+    // Catalyst proximity is what makes a peer actionable — a peer reporting in
+    // 2 days outranks a larger one reporting in 5. Market cap breaks ties only
+    // among peers reporting on the SAME date (the bigger name is the more
+    // material mover). Dates are zero-padded "YYYY-MM-DD", so lexicographic
+    // string compare is a correct chronological compare. The extension applies
+    // the identical ordering client-side after re-validating the dates, so the
+    // two never disagree.
+    peersWithEarnings.sort((a, b) => {
+      if (a.nextEarningsDate !== b.nextEarningsDate) {
+        return a.nextEarningsDate < b.nextEarningsDate ? -1 : 1;
+      }
+      return b.marketCap - a.marketCap;
+    });
+
     // >=1 peer with an upcoming earnings date -> write the full block.
     const result = {
       symbol,
       qualified: true,
-      matchLevel: matchLevel || null,
-      peers: peersWithEarnings,        // market-cap desc; extension re-orders soonest-first
+      matchLevel: matchLevel || null,  // always "industry" now (never "sector")
+      peers: peersWithEarnings,        // soonest-first, market-cap desc tiebreak
       computedAt: new Date().toISOString(),
     };
     await redis.set(`peers:${symbol}`, result, { ex: PEERS_TTL_SECONDS });
@@ -794,7 +847,7 @@ async function processPeerSymbol(row, index) {
     console.log(
       `  ✓ ${symbol.padEnd(6)}: ${peersWithEarnings.length} peer(s)` +
       ` [${matchLevel}]` +
-      ` | nearest ${peersWithEarnings.map(p => p.nextEarningsDate).sort()[0]}`
+      ` | nearest ${peersWithEarnings[0].nextEarningsDate}`   // already soonest-first
     );
     return 'written';
 

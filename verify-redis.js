@@ -10,7 +10,7 @@ const redis = new Redis({
 async function checkRedis() {
   console.log('=== Checking Redis Data ===\n');
   
-  const testSymbols = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'GOOGL'];
+  const testSymbols = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'GOOGL', 'LUV', 'KO', 'UAL', 'RYAAY'];
   
   for (const symbol of testSymbols) {
     try {

@@ -13,7 +13,7 @@ async function checkPeers() {
   console.log('=== Checking Sympathy Peer Data (peers:{SYMBOL}) ===\n');
 
   // Dense industry (should get full blocks) + a few majors. Adjust as needed.
-  const testSymbols = ['NVDA', 'AMD', 'MRVL', 'INTC', 'AAPL', 'MSFT'];
+  const testSymbols = ['NVDA', 'AMD', 'MRVL', 'INTC', 'AAPL', 'MSFT', 'LUV', 'UAL', 'KO'];
 
   let written = 0, case1 = 0, missing = 0;
 
