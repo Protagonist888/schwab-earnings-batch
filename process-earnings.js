@@ -112,6 +112,111 @@ const PEER_CAP_RATIO       = 3.0;
 const PEER_LIST_MAX        = 8;       // max peers stored per symbol
 
 // ---------------------------------------------------------------------------
+// FINDING D — issuer duplication that ISN'T a ticker-suffix variant.
+//
+// Observed in production (2026-07-12), peers:WFC:
+//   BAC, HSBC, HBCYF, RY, IDCBF, CICHF, CICHY   — "7 peers"
+// but HSBC and HBCYF are the SAME issuer (HSBC Holdings: NYSE ADR + OTC
+// ordinary), and CICHF/CICHY are the same issuer (China Construction Bank:
+// two OTC lines). The real issuer count was 5, not 7. Two peer slots were
+// spent naming one company twice.
+//
+// splitTicker() cannot catch this: HSBC and HBCYF share no ticker root. The
+// same mechanism produces GOOG/GOOGL, FOX/FOXA, UA/UAA, MITSF/MITSY.
+//
+// The discriminator is the COMPANY NAME, which the screener returns and which
+// this batch was discarding (see Finding E). "HSBC Holdings plc ADR" and
+// "HSBC Holdings plc" share their leading significant tokens; so do
+// "Alphabet Inc Class A" and "Alphabet Inc Class C".
+//
+// TWO INDEPENDENT DEFENSES (deliberate; they fail differently):
+//
+//   1. ISSUER-NAME DEDUPE (computeStructuralPeers): group in-band candidates by
+//      a normalized issuer key derived from `name`; keep ONE line per issuer.
+//      This is the only thing that catches a LIQUID duplicate pair such as
+//      GOOG/GOOGL, which no volume floor would ever remove.
+//
+//   2. LIQUIDITY FLOOR (applyCapBand): drop candidates whose average dollar
+//      volume is below MIN_DOLLAR_VOLUME. Grey-market OTC lines (HBCYF, CICHF,
+//      IDCBF) trade in the thousands of dollars a day. They do not "move in
+//      sympathy" with anything on a US earnings print because they barely move
+//      at all — nobody is trading them. This catches thin duplicate lines even
+//      when the name heuristic misses, and independently closes the
+//      illiquid-peer hole (a peer nobody trades is not a tradeable signal).
+//
+// WHICH LINE SURVIVES DEDUPE: the one with the highest average DOLLAR VOLUME,
+// not the highest market cap. Market cap is a property of the ISSUER and is
+// therefore near-identical across an issuer's share lines — it cannot rank
+// them. Dollar volume is a property of the LINE, and answers the question that
+// actually matters: which ticker do people actually trade? That is the one a
+// sympathy move would show up in.
+// ---------------------------------------------------------------------------
+
+// Minimum average dollar volume (adjusted_close x avgvol_200d) for a candidate
+// to be eligible as a peer. 200-day average is used rather than 1-day because
+// a single session's volume is noisy (one block trade in an otherwise dead OTC
+// line would clear a 1-day floor).
+//
+// $10M/day is deliberately permissive: it admits genuinely small but real
+// listings while excluding grey-market lines by two or more orders of
+// magnitude. This is a DIAL — if peer coverage proves too thin, this is the
+// first thing to relax, and it can be relaxed safely because unlike the sector
+// fallback it does not admit business-unrelated names.
+const MIN_DOLLAR_VOLUME = 10_000_000;
+
+// ---------------------------------------------------------------------------
+// §4.5 — SAME-DATE COLLISION.
+//
+// A structural peer that reports on (or within a day of) the traded symbol's
+// OWN earnings date is not a "sympathy" catalyst. The user's own earnings print
+// dominates the session; a co-reporting peer's move is drowned out by — and
+// confounded with — the user's own reaction. Telling a JPM holder that "BAC's
+// earnings on Oct 14 may move JPM in sympathy" is misleading when JPM ALSO
+// reports Oct 14: JPM will move on its OWN print, not in sympathy with BAC.
+//
+// The peer is NOT dropped. BAC is still JPM's closest real peer, and a user
+// looking at JPM that week wants to see it. Only the FRAMING is wrong. The
+// batch therefore sets a `sameDateAsSelf` boolean on the peer and leaves the
+// presentation choice to the extension (e.g. "also reports Oct 14" instead of
+// "possible sympathy move"). This mirrors how matchLevel is bag-internal data
+// the client interprets — the batch states the fact, the UI decides the words.
+//
+// Tolerance is 1 day, not 0: earnings dates from different sources drift by a
+// day (before/after close, timezone of the source), and two banks reporting
+// "the morning of the 14th" vs "after close on the 13th" are the same event for
+// this purpose. Widening beyond 1 would start flagging genuinely independent
+// catalysts in the same reporting week, which we do NOT want to suppress.
+const SAME_DATE_TOLERANCE_DAYS = 1;
+
+// Tokens stripped when deriving an issuer key from a company name. These are
+// legal-form suffixes, share-class markers and listing-type markers — none of
+// them distinguish one ISSUER from another, and all of them are exactly what
+// differs between two lines of the SAME issuer ("... plc" vs "... plc ADR",
+// "... Inc Class A" vs "... Inc Class C").
+const ISSUER_NAME_NOISE = new Set([
+  // legal forms
+  'inc','incorporated','corp','corporation','co','company','companies',
+  'ltd','limited','llc','lp','plc','ag','sa','se','nv','ab','as','oyj',
+  'spa','kgaa','gmbh','pte','pty','bhd','sdn','kk','holding','holdings',
+  'group','grp','the','and','of',
+  // listing / share-class markers
+  'adr','ads','ord','ordinary','shares','share','cls','class',
+  'sponsored','unsponsored','depositary','receipt','receipts',
+  'common','stock','units','unit','new','reg','registered',
+  'a','b','c','d',
+]);
+
+// Number of leading significant name tokens that define an issuer. Two is the
+// deliberate choice:
+//   - ONE would over-merge: "First Republic" / "First Horizon" / "First Solar"
+//     all collapse to "first" — three unrelated issuers merged into one.
+//   - THREE would under-merge: it re-admits tokens that legitimately differ
+//     between an issuer's own lines.
+// Two tokens correctly separate "hsbc holdings" from "royal bank", while
+// correctly merging "hsbc holdings plc adr" with "hsbc holdings plc".
+const ISSUER_KEY_TOKENS = 2;
+
+// ---------------------------------------------------------------------------
 // FINDING A — non-common-equity share lines must never appear as peers.
 //
 // Observed in production (2026-07-11): a JPM sympathy card listed BAC, JPM-PC,
@@ -136,6 +241,13 @@ const PEER_LIST_MAX        = 8;       // max peers stored per symbol
 //      survived (1). This catches legitimate multi-class COMMON lines, which
 //      (1) intentionally does NOT drop — e.g. BRK-A/BRK-B, GOOG/GOOGL are real
 //      common shares of one issuer, and must not be peers of each other.
+//
+// NOTE (Finding D): defense 2 excludes an issuer's other lines from ITS OWN
+// peer list, by ticker root. It does NOT stop two lines of a THIRD issuer from
+// both appearing in someone else's list (GOOG and GOOGL as peers of META), and
+// it does not catch same-issuer lines with unrelated roots (HSBC/HBCYF). That
+// is what the Finding D issuer-name dedupe above is for. The two rules are
+// complements, not duplicates.
 //
 // Suffix conventions vary by vendor; EODHD/Schwab US lines use a hyphen:
 //   PREFERRED : JPM-PC, JPM-PD, BAC-PB, WFC-PL   (root + "-P" + series letter)
@@ -195,12 +307,80 @@ function isNonCommonEquity(symbol) {
   return NON_COMMON_SUFFIXES.has(suffix);
 }
 
+/**
+ * Derive a normalized ISSUER KEY from a company name, for grouping share lines
+ * of the same company (Finding D). Lowercases, strips punctuation, removes
+ * legal-form / share-class / listing-type noise tokens, and keeps the first
+ * ISSUER_KEY_TOKENS significant tokens.
+ *
+ *   "HSBC Holdings plc ADR"   -> "hsbc"           (holdings, plc, adr all noise)
+ *   "HSBC Holdings plc"       -> "hsbc"           ... same key, correctly merged
+ *   "Alphabet Inc Class A"    -> "alphabet"
+ *   "Alphabet Inc Class C"    -> "alphabet"       ... same key, correctly merged
+ *   "Bank of America Corp"    -> "bank america"   (of, corp noise)
+ *   "JPMorgan Chase & Co"     -> "jpmorgan chase"
+ *
+ * Returns null when no significant token survives — the caller MUST treat null
+ * as "cannot group" and keep the row rather than merging it into a bucket with
+ * every other unnamed row. Silently collapsing all no-name rows into one issuer
+ * would delete real peers.
+ *
+ * @param {?string} name
+ * @returns {string|null}
+ */
+function issuerKey(name) {
+  if (typeof name !== 'string' || name.trim() === '') return null;
+
+  const tokens = name
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')   // & . , - / ' etc -> space
+    .split(/\s+/)
+    .filter(t => t !== '' && !ISSUER_NAME_NOISE.has(t));
+
+  if (tokens.length === 0) return null;
+  return tokens.slice(0, ISSUER_KEY_TOKENS).join(' ');
+}
+
+/**
+ * Average DOLLAR volume for a universe row: price x 200-day average share
+ * volume. Both fields come free on the screener row (Finding E).
+ *
+ * Returns 0 when either input is missing or non-finite, which makes an
+ * unmeasurable row fail the liquidity floor. That is the intended direction:
+ * a candidate we cannot show is liquid is not admitted as a peer.
+ *
+ * @param {{price: ?number, avgVolume: ?number}} row
+ * @returns {number} average dollar volume, or 0 when unmeasurable
+ */
+function dollarVolume(row) {
+  if (!row) return 0;
+  const p = Number(row.price);
+  const v = Number(row.avgVolume);
+  if (!Number.isFinite(p) || !Number.isFinite(v)) return 0;
+  if (p <= 0 || v <= 0) return 0;
+  return p * v;
+}
+
 // Phase 4 (sympathy peers): full universe metadata captured during the Phase 1
 // screener build ({ symbol, marketCap, sector, industry }). Populated by
 // getAllSymbols() and read only by computePeers(). Kept module-level so Phase 2
 // and Phase 3 keep consuming the plain symbol-string array unchanged — their
 // signatures and behavior are untouched.
 let universeMeta = [];
+
+// Phase 4 diagnostics (Finding D): running total of candidate rows discarded as
+// duplicate share lines of an issuer already present in the same peer list
+// (HSBC/HBCYF, GOOG/GOOGL, CICHF/CICHY).
+//
+// Module-level ON PURPOSE. processPeerSymbol() returns a bare outcome STRING
+// ('written'|'case1'|'skipped'|'error') that the Phase 4 loop switches on;
+// widening that return to an object would force a restructure of the loop and
+// of every branch reading it. Accumulating here keeps that contract intact.
+//
+// MUST be reset at the top of the Phase 4 block (not declared inside the loop —
+// a `let` inside the loop body is re-created and zeroed every iteration, never
+// accumulates, and is out of scope in the summary).
+let peerDupesDropped = 0;
 
 // Abort if universe is implausibly small (API key issue, plan problem, etc.)
 const MIN_SYMBOL_COUNT = 200;
@@ -266,14 +446,35 @@ async function fetchJSON(url, attempt = 1, maxRetries = 5) {
 /**
  * Build the filtered symbol universe using the EODHD Screener API.
  *
- * Key facts confirmed from live screener response:
+ * Key facts CONFIRMED from a live screener response (re-verified 2026-07-14
+ * against the raw endpoint — see Finding E; do not trust this list without
+ * re-dumping a row, an earlier version of it was wrong):
  *   - Response shape: { "data": [ {...}, ... ] }  — no "total" field
  *   - Exchange field value is "US" for all US listings (NYSE + NASDAQ both
  *     normalize to "US" in EODHD). Filter with exchange = "US" — NOT
  *     "NYSE" or "NASDAQ" which return nothing from this endpoint.
  *   - Pagination stop: when data.length < SCREENER_PAGE_SIZE (last page).
- *   - Market cap field: "market_capitalization" — raw USD integer (not millions).
- *   - Ticker field: "code".
+ *   - Ticker field:     "code"                   e.g. "NVDA"
+ *   - Company name:     "name"                   e.g. "NVIDIA Corporation"
+ *   - Market cap:       "market_capitalization"  raw USD integer (not millions)
+ *   - Sector/industry:  "sector" / "industry"    flat strings
+ *   - Last price:       "adjusted_close"
+ *   - Avg volume:       "avgvol_1d", "avgvol_200d"   (SHARES, not dollars)
+ *   - There is NO "type" field. See the ETF note below.
+ *
+ * FINDING E — fields that were arriving and being THROWN AWAY.
+ * This function previously read only code / market_capitalization / sector /
+ * industry. The screener was, on the same rows and at the same cost, also
+ * returning `name`, `adjusted_close` and `avgvol_200d`. Downstream code had
+ * written `name: peer.symbol` with the comment "screener rows carry no company
+ * name" — an assumption that was never checked against the payload and was
+ * false. Capturing these three fields costs ZERO additional API calls and is
+ * what makes the Finding D issuer dedupe and the liquidity floor possible.
+ *
+ * Fields are captured DEFENSIVELY (null / 0 when absent or unparseable) rather
+ * than assumed present, so that if EODHD ever drops one, this degrades to the
+ * old behavior instead of throwing. The per-field coverage counters logged at
+ * the end of this function exist to surface exactly that.
  *
  * API cost: ~15-20 pages × 5 credits = ~75-100 credits total.
  *
@@ -294,7 +495,8 @@ async function getAllSymbols() {
     ['exchange',              '=', 'US']
   ]);
 
-  const symbolsWithCap = [];  // [{ symbol, marketCap, sector, industry }]
+  // [{ symbol, name, marketCap, sector, industry, price, avgVolume }]
+  const symbolsWithCap = [];
   let nonCommonSkipped = 0;   // Finding A: preferred/warrant/right/unit lines dropped
   let offset  = 0;
   let pageNum = 0;
@@ -342,14 +544,20 @@ async function getAllSymbols() {
 
       if (!symbol) continue;
 
-      // Skip ETFs and funds if the type field is present and explicit.
-      // Most ETFs are already excluded by the market_capitalization filter
-      // (they report $0 or null cap) but some leveraged ETFs have non-zero
-      // cap figures that slip through.
-      if (item.type) {
-        const t = item.type.toUpperCase();
-        if (t.includes('ETF') || t.includes('FUND')) continue;
-      }
+      // NOTE — there is NO `type` field on this endpoint. A previous version of
+      // this loop guarded `if (item.type) { ...skip ETF/FUND... }`, which was
+      // dead code: the branch never executed because the property is always
+      // undefined. It has been removed rather than left in place looking like a
+      // working guard.
+      //
+      // ETFs are excluded in practice by the market_capitalization filter (funds
+      // report $0/null cap and never clear MARKET_CAP_FLOOR). Any leveraged ETF
+      // that reports a non-zero cap figure and slips through is now additionally
+      // caught downstream: it will carry no `industry` string (peerless), and the
+      // liquidity floor / issuer dedupe operate on it like any other row. If ETF
+      // contamination is ever OBSERVED in a peer list, the fix is a real one —
+      // an explicit exclude-list or a Fundamentals type lookup — not a resurrected
+      // check against a field the API does not send.
 
       // FINDING A, defense 1 — drop NON-COMMON-EQUITY lines (preferred shares,
       // warrants, rights, units). Two reasons:
@@ -362,7 +570,9 @@ async function getAllSymbols() {
       //       compared exact symbol strings.
       // Multi-class COMMON lines (BRK-A, BRK-B) are deliberately NOT dropped
       // here — they are genuine common shares. They are prevented from being
-      // peers of their own issuer by the issuer-root rule in applyCapBand.
+      // peers of their own issuer by the issuer-root rule in applyCapBand, and
+      // from double-occupying a THIRD symbol's peer list by the Finding D
+      // issuer-name dedupe in computeStructuralPeers.
       if (isNonCommonEquity(symbol)) {
         nonCommonSkipped++;
         continue;
@@ -379,7 +589,30 @@ async function getAllSymbols() {
       const industry = (typeof item.industry === 'string' && item.industry.trim() !== '')
         ? item.industry.trim() : null;
 
-      symbolsWithCap.push({ symbol, marketCap, sector, industry });
+      // FINDING E — company name. The discriminator for the Finding D issuer
+      // dedupe: "HSBC Holdings plc ADR" vs "HSBC Holdings plc" is the ONLY
+      // signal that HSBC and HBCYF are one company, since their ticker roots
+      // share nothing. Null (not the ticker) when absent — issuerKey() treats
+      // null as "cannot group / keep the row", whereas a ticker placeholder
+      // would look like a real name and defeat the grouping.
+      const name = (typeof item.name === 'string' && item.name.trim() !== '')
+        ? item.name.trim() : null;
+
+      // FINDING E — liquidity inputs. `avgvol_200d` is in SHARES; multiplying by
+      // `adjusted_close` gives average DOLLAR volume, which is what the peer
+      // liquidity floor tests (see dollarVolume() / MIN_DOLLAR_VOLUME).
+      //
+      // 200-day is used in preference to avgvol_1d because a single session is
+      // noisy: one block trade in an otherwise dead OTC line would clear a
+      // 1-day floor. Both are stored as null when unparseable so that
+      // dollarVolume() returns 0 and the row FAILS the floor — a candidate we
+      // cannot prove is liquid is not admitted as a peer.
+      const priceRaw     = parseFloat(item.adjusted_close);
+      const avgVolumeRaw = parseFloat(item.avgvol_200d);
+      const price     = Number.isFinite(priceRaw)     && priceRaw     > 0 ? priceRaw     : null;
+      const avgVolume = Number.isFinite(avgVolumeRaw) && avgVolumeRaw > 0 ? avgVolumeRaw : null;
+
+      symbolsWithCap.push({ symbol, name, marketCap, sector, industry, price, avgVolume });
     }
 
     console.log(
@@ -398,11 +631,6 @@ async function getAllSymbols() {
     await sleep(500); // 500ms between screener pages — polite pacing
   }
 
-  if (symbolsWithCap.length < MIN_SYMBOL_COUNT) {
-    console.error(`CRITICAL: Only ${symbolsWithCap.length} symbols after screener — below minimum ${MIN_SYMBOL_COUNT}. Check API key/plan. Aborting.`);
-    process.exit(1);
-  }
-
   // The screener already returns results sorted by market_cap desc per page,
   // but after merging all pages we re-sort to guarantee global ordering.
   symbolsWithCap.sort((a, b) => b.marketCap - a.marketCap);
@@ -414,20 +642,26 @@ async function getAllSymbols() {
   // this is a side-channel that changes nothing about the existing return.
   universeMeta = symbolsWithCap;
 
-  // Quick coverage signal: how many rows actually carried a sector/industry.
-  // If EODHD ever stops returning these on the screener, this surfaces it
-  // loudly rather than silently degrading peer coverage.
-  const withSector   = symbolsWithCap.filter(s => s.sector).length;
-  const withIndustry = symbolsWithCap.filter(s => s.industry).length;
+  // Quick coverage signal: how many rows actually carried each optional field.
+  // If EODHD ever stops returning one, this surfaces it immediately in the log
+  // instead of silently degrading peer quality weeks later. `name` and
+  // `avgVolume` are load-bearing for Finding D / the liquidity floor — a sharp
+  // drop in either means peers will start duplicating issuers or vanishing.
+  const withSector    = symbolsWithCap.filter(s => s.sector).length;
+  const withIndustry  = symbolsWithCap.filter(s => s.industry).length;
+  const withName      = symbolsWithCap.filter(s => s.name).length;
+  const withLiquidity = symbolsWithCap.filter(s => dollarVolume(s) > 0).length;
 
-  console.log('');
-  console.log('=== UNIVERSE BUILD COMPLETE ===');
-  console.log(`  Final universe: ${finalSymbols.length} symbols`);
-  console.log(`  With sector:    ${withSector} | with industry: ${withIndustry}`);
   console.log(`  Non-common lines skipped (pref/warrant/right/unit): ${nonCommonSkipped}`);
-  console.log(`  Top 10:    ${finalSymbols.slice(0, 10).join(', ')}`);
-  console.log(`  Bottom 10: ${finalSymbols.slice(-10).join(', ')}`);
-  console.log('');
+  console.log(`  With sector:    ${withSector} | with industry: ${withIndustry}`);
+  console.log(`  With name:      ${withName} | with liquidity data: ${withLiquidity}`);
+
+  if (withName < symbolsWithCap.length * 0.9) {
+    console.warn(`  ⚠ name coverage is ${withName}/${symbolsWithCap.length} — issuer dedupe (Finding D) will be degraded.`);
+  }
+  if (withLiquidity < symbolsWithCap.length * 0.9) {
+    console.warn(`  ⚠ liquidity coverage is ${withLiquidity}/${symbolsWithCap.length} — peers will be dropped by the floor. Check adjusted_close/avgvol_200d.`);
+  }
 
   return finalSymbols;
 }
@@ -774,15 +1008,20 @@ function buildUniverseIndex(meta) {
 }
 
 /**
- * Apply the cap band and exclude EVERY share line of the traded issuer.
- * Keeps candidates whose marketCap is within [C/ratio, C*ratio] and > 0.
+ * Apply the per-row peer eligibility filters:
+ *   1. ISSUER-ROOT self-exclusion  (Finding A, defense 2)
+ *   2. Market-cap band             [C/ratio, C*ratio], cap > 0
+ *   3. Liquidity floor             (Finding D, defense 2)
  *
- * FINDING A, defense 2 — the exclusion is by ISSUER ROOT, not exact string.
+ * All three are ROW-LOCAL tests — each candidate is judged on its own, with no
+ * reference to the other candidates. That is why the Finding D issuer DEDUPE is
+ * NOT here: dedupe is a SET operation (it compares candidates to each other) and
+ * lives in computeStructuralPeers().
  *
- * @param {Array<{symbol,marketCap}>} candidates
+ * @param {Array<{symbol,name,marketCap,price,avgVolume}>} candidates
  * @param {string} selfSymbol
  * @param {number} C   traded symbol's market cap (> 0)
- * @returns {Array} in-band candidates, all lines of self excluded
+ * @returns {Array} eligible candidates, all lines of self excluded
  */
 function applyCapBand(candidates, selfSymbol, C) {
   const lo = C / PEER_CAP_RATIO;
@@ -793,14 +1032,133 @@ function applyCapBand(candidates, selfSymbol, C) {
   // is true). Comparing ISSUER ROOTS excludes every share line of the traded
   // issuer — preferred, warrant, or a second common class (BRK-A vs BRK-B).
   // A company can never be its own sympathy peer.
+  //
+  // NOTE: this is a TICKER-ROOT test and only catches self-lines that share a
+  // root. It does NOT catch a same-issuer line with an unrelated root (the
+  // HSBC/HBCYF shape). For the traded symbol itself that gap is closed by the
+  // issuer-NAME check below; for THIRD-party issuers it is closed by the dedupe
+  // in computeStructuralPeers().
   const selfRoot = splitTicker(selfSymbol).root;
 
-  return candidates.filter(row =>
-    splitTicker(row.symbol).root !== selfRoot &&
-    row.marketCap > 0 &&
-    row.marketCap >= lo &&
-    row.marketCap <= hi
-  );
+  // Issuer-NAME self-exclusion (Finding D, applied to SELF). Belt-and-braces on
+  // top of the root test: if the traded symbol is HSBC and the universe also
+  // carries HBCYF, the root test passes HBCYF through (no shared root) and the
+  // card would list the company as its own peer under a different ticker. The
+  // name key catches it. Null-safe: when either name is missing, issuerKey
+  // returns null and this test is skipped rather than merging unnamed rows.
+  const selfMeta = candidates.find(r => r && r.symbol === selfSymbol);
+  const selfKey  = selfMeta ? issuerKey(selfMeta.name) : null;
+
+  return candidates.filter(row => {
+    if (!row || typeof row.symbol !== 'string') return false;
+
+    // 1. Never the traded issuer itself — by ticker root...
+    if (splitTicker(row.symbol).root === selfRoot) return false;
+
+    // ...or by issuer name, when both names are known.
+    if (selfKey !== null) {
+      const k = issuerKey(row.name);
+      if (k !== null && k === selfKey) return false;
+    }
+
+    // 2. Market-cap band.
+    if (!(row.marketCap > 0))    return false;
+    if (row.marketCap < lo)      return false;
+    if (row.marketCap > hi)      return false;
+
+    // 3. LIQUIDITY FLOOR (Finding D, defense 2). A peer nobody trades is not a
+    //    tradeable signal. Grey-market OTC lines (HBCYF ~$10k/day, CICHF,
+    //    IDCBF) clear the cap band trivially — market cap is a property of the
+    //    ISSUER, so an OTC line of a $340B bank "has" a $340B cap while trading
+    //    four figures a day. Dollar volume is a property of the LINE, and is
+    //    the only field here that can tell them apart.
+    //
+    //    Fails CLOSED: dollarVolume() returns 0 when price or volume is missing
+    //    or unparseable, so a row we cannot PROVE is liquid is not admitted.
+    if (dollarVolume(row) < MIN_DOLLAR_VOLUME) return false;
+
+    return true;
+  });
+}
+
+/**
+ * Collapse candidate rows that are the SAME ISSUER down to a single line
+ * (Finding D, defense 1).
+ *
+ * Observed in production: peers:WFC listed HSBC and HBCYF (both HSBC Holdings)
+ * and CICHF and CICHY (both China Construction Bank) — 7 "peers" that were
+ * really 5 companies. Two of eight peer slots named one company twice.
+ *
+ * WHICH LINE SURVIVES: the one with the highest average DOLLAR VOLUME. Market
+ * cap CANNOT rank an issuer's lines against each other — it is a property of
+ * the issuer and is near-identical across them (HSBC and HBCYF both report
+ * ~$340B). Dollar volume is a property of the LINE and answers the question
+ * that actually matters: which ticker do people actually trade? A sympathy move
+ * shows up in the liquid line, not in the grey-market one.
+ *
+ * NULL CONTRACT — load-bearing. issuerKey() returns null when a row has no
+ * usable name. Such rows are KEPT UNCONDITIONALLY and are never grouped. The
+ * naive implementation buckets them all under a single falsy key and dedupes
+ * them down to ONE row — silently deleting real, distinct peers and making
+ * coverage WORSE than before the fix. If name coverage ever degrades (see the
+ * withName warning in getAllSymbols), this path is what keeps the failure
+ * graceful instead of destructive.
+ *
+ * Input order is not relied upon. Ties in dollar volume are broken by market
+ * cap, then by symbol, so the output is deterministic run-to-run.
+ *
+ * @param {Array<{symbol,name,marketCap,price,avgVolume}>} candidates
+ * @returns {{ deduped: Array, dropped: number }}
+ */
+function dedupeByIssuer(candidates) {
+  const best     = new Map();  // issuerKey -> winning row
+  const ungroup  = [];         // rows with no usable name — never merged
+  let   dropped  = 0;
+
+  for (const row of candidates) {
+    const key = issuerKey(row.name);
+
+    // NULL CONTRACT: cannot identify the issuer -> keep the row as-is.
+    if (key === null) {
+      ungroup.push(row);
+      continue;
+    }
+
+    const incumbent = best.get(key);
+    if (!incumbent) {
+      best.set(key, row);
+      continue;
+    }
+
+    // Same issuer, two lines. Keep the one that actually trades.
+    dropped++;
+    if (isMoreTradedLine(row, incumbent)) {
+      best.set(key, row);
+    }
+  }
+
+  return { deduped: [...best.values(), ...ungroup], dropped };
+}
+
+/**
+ * True when line `a` is the better-traded line of an issuer than line `b`.
+ * Ordered: dollar volume DESC, then market cap DESC, then symbol ASC. The
+ * trailing symbol compare exists purely to make the outcome deterministic when
+ * two lines are otherwise indistinguishable — without it, the surviving ticker
+ * could flip between runs on the same data.
+ *
+ * @returns {boolean}
+ */
+function isMoreTradedLine(a, b) {
+  const dva = dollarVolume(a);
+  const dvb = dollarVolume(b);
+  if (dva !== dvb) return dva > dvb;
+
+  const ca = a.marketCap || 0;
+  const cb = b.marketCap || 0;
+  if (ca !== cb) return ca > cb;
+
+  return a.symbol < b.symbol;
 }
 
 /**
@@ -808,9 +1166,19 @@ function applyCapBand(candidates, selfSymbol, C) {
  * Pure/local — no I/O. Returns the structural peer set (before the earnings
  * join) plus the matchLevel, or a structurally-peerless marker.
  *
- * @returns {{ matchLevel: 'industry'|'sector'|null, peers: Array }}
- *   peers is the top-8 in-band structural peer rows (market-cap desc), self
- *   excluded. Empty array => structurally peerless (case-1 candidate).
+ * PIPELINE ORDER IS DELIBERATE:
+ *   industry bucket -> applyCapBand (row-local) -> dedupeByIssuer (set) -> slice
+ *
+ * Dedupe MUST run BEFORE the top-PEER_LIST_MAX slice. If it ran after, duplicate
+ * lines would already have EVICTED real peers from the list before being
+ * removed from it — WFC would spend 2 of its 8 slots on HSBC/HBCYF and
+ * CICHF/CICHY, push 2 genuine banks out, and only then collapse to 5 entries.
+ * Filtering first and slicing last is what makes the slots go to real companies.
+ *
+ * @returns {{ matchLevel: 'industry'|null, peers: Array }}
+ *   peers is the top-PEER_LIST_MAX eligible, issuer-deduped structural peer rows
+ *   (market-cap desc), self excluded. Empty array => structurally peerless
+ *   (case-1 candidate).
  */
 function computeStructuralPeers(row, index) {
   const C = row.marketCap;
@@ -827,15 +1195,26 @@ function computeStructuralPeers(row, index) {
     return { matchLevel: null, peers: [] };
   }
 
-  // Same-industry candidates within the (now 3.0x) cap band. Self-exclusion and
-  // the marketCap > 0 guard are handled inside applyCapBand.
-  const inBand = applyCapBand(index.byIndustry.get(row.industry), row.symbol, C);
+  // Row-local eligibility: self-exclusion, cap band, liquidity floor.
+  const eligible = applyCapBand(index.byIndustry.get(row.industry), row.symbol, C);
 
-  if (inBand.length === 0) {
-    // Structurally peerless: no same-industry name survives the band. This is a
-    // CASE 1 candidate — the extension shows "no comparable peers". We do NOT
+  if (eligible.length === 0) {
+    // Structurally peerless: no same-industry name survives the filters. This is
+    // a CASE 1 candidate — the extension shows "no comparable peers". We do NOT
     // fall back to sector; a wrong peer is worse than no peer.
     return { matchLevel: null, peers: [] };
+  }
+
+  // Set-level: collapse multiple share lines of one issuer to the traded line.
+  const { deduped, dropped } = dedupeByIssuer(eligible);
+
+  // Defensive: dedupe can only ever SHRINK the set, and only when it found a
+  // duplicate — so it can never empty a non-empty set. Guarded anyway, because
+  // a silent [] here would be misread downstream as case-1 ("no comparable
+  // peers") when the truth would be "a bug ate the peers".
+  if (deduped.length === 0) {
+    console.warn(`  ⚠ ${row.symbol}: dedupeByIssuer emptied a non-empty candidate set (${eligible.length} in). This is a bug — treating as peerless.`);
+    return { matchLevel: null, peers: [], dupesDropped: dropped };
   }
 
   // Trim to the top PEER_LIST_MAX by market cap descending. Market cap is the
@@ -843,13 +1222,13 @@ function computeStructuralPeers(row, index) {
   // sympathy movers), even though the stored/display ORDER is soonest-earnings
   // first — that ordering is applied later, in processPeerSymbol(), once each
   // peer's earnings date is known.
-  inBand.sort((a, b) => b.marketCap - a.marketCap);
-  const top = inBand.slice(0, PEER_LIST_MAX);
+  deduped.sort((a, b) => b.marketCap - a.marketCap);
+  const top = deduped.slice(0, PEER_LIST_MAX);
 
   // matchLevel is always "industry" now (or null when peerless). Retained in the
   // stored block for schema compatibility and analytics; the extension treats it
   // as bag-internal.
-  return { matchLevel: 'industry', peers: top };
+  return { matchLevel: 'industry', peers: top, dupesDropped: dropped };
 }
 
 /**
@@ -882,21 +1261,77 @@ async function getPeerNextEarningsDate(peerSymbol) {
 }
 
 /**
+ * Read the traded symbol's OWN next earnings date from its earnings:{SYMBOL}
+ * cache, for the same-date collision check (§4.5). Unlike
+ * getPeerNextEarningsDate(), this does NOT reject a past date: we want the
+ * symbol's own date whatever it is, purely to compare it against each peer's.
+ * A null return (no cache, malformed, or unparseable) simply disables the
+ * collision check for this symbol — peers are then written unflagged, which is
+ * the safe default (we never invent a collision we cannot prove).
+ *
+ * @param {string} symbol
+ * @returns {Promise<string|null>} "YYYY-MM-DD" or null
+ */
+async function getOwnNextEarningsDate(symbol) {
+  try {
+    const cached = await redis.get(`earnings:${symbol}`);
+    if (!cached || typeof cached !== 'object') return null;
+    const nextDate = cached.nextDate;
+    if (!DateUtils.isValidDateFormat(nextDate)) return null;
+    return nextDate;
+  } catch (err) {
+    console.error(`  ⚠ own earnings read failed for ${symbol} (non-fatal): ${err.message}`);
+    return null;
+  }
+}
+
+/**
+ * True when two "YYYY-MM-DD" dates fall within `tolDays` of each other. Used to
+ * flag a peer that reports on (or adjacent to) the traded symbol's own earnings
+ * date — see SAME_DATE_TOLERANCE_DAYS. Returns false if either date is missing
+ * or unparseable (cannot prove a collision => do not flag one).
+ *
+ * @param {?string} a  "YYYY-MM-DD"
+ * @param {?string} b  "YYYY-MM-DD"
+ * @param {number}  tolDays  inclusive tolerance in days
+ * @returns {boolean}
+ */
+function datesWithin(a, b, tolDays) {
+  if (!DateUtils.isValidDateFormat(a) || !DateUtils.isValidDateFormat(b)) return false;
+  // Parse as UTC midnight to avoid any local-timezone / DST drift in the diff.
+  const ta = Date.parse(`${a}T00:00:00Z`);
+  const tb = Date.parse(`${b}T00:00:00Z`);
+  if (!Number.isFinite(ta) || !Number.isFinite(tb)) return false;
+  const diffDays = Math.abs(ta - tb) / 86_400_000;
+  return diffDays <= tolDays;
+}
+
+/**
  * Compute + write peers:{SYMBOL} for one symbol. Reuses the pre-built universe
  * index (structural peers) and reads earnings:{SYMBOL} for each peer's date.
  *
- * @param {{symbol,marketCap,sector,industry}} row  traded symbol's universe row
+ * @param {{symbol,name,marketCap,sector,industry,price,avgVolume}} row
+ *        the traded symbol's universe row
  * @param {object} index  output of buildUniverseIndex()
  * @returns {Promise<'written'|'case1'|'skipped'|'error'>}
  */
 async function processPeerSymbol(row, index) {
   const symbol = row.symbol;
   try {
-    const { matchLevel, peers: structuralPeers } = computeStructuralPeers(row, index);
+    const { matchLevel, peers: structuralPeers, dupesDropped = 0 } =
+      computeStructuralPeers(row, index);
 
-    // CASE 1: structurally peerless — no comparable peers even after fallback.
-    // Write an explicit qualified-but-empty block so the extension shows the
-    // "no comparable peers" note. This is the meaningful empty.
+    // Finding D diagnostic. Accumulated even on the case-1 path below: a symbol
+    // can have its entire candidate set collapse to duplicates of ONE issuer and
+    // still end up peerless, and that is precisely a case worth seeing in the
+    // summary rather than losing.
+    peerDupesDropped += dupesDropped;
+
+    // CASE 1: structurally peerless — no same-industry name survived the cap
+    // band, the liquidity floor, and self-exclusion. Write an explicit
+    // qualified-but-empty block so the extension shows the "no comparable peers"
+    // note. This is the meaningful empty. (There is no sector fallback: a wrong
+    // peer is worse than no peer.)
     if (structuralPeers.length === 0) {
       const case1 = {
         symbol,
@@ -910,6 +1345,11 @@ async function processPeerSymbol(row, index) {
       return 'case1';
     }
 
+    // The traded symbol's OWN next earnings date, for the §4.5 same-date check.
+    // Read once here (not per-peer) — one extra Redis GET per symbol. null when
+    // unknown, which simply disables the flag for this symbol (safe default).
+    const ownNextEarningsDate = await getOwnNextEarningsDate(symbol);
+
     // Step 6-7: join each structural peer's upcoming earnings date (Redis read),
     // dropping peers with no upcoming date. Sequential to stay well under any
     // Upstash rate ceiling; the structural set is <= 8, so this is cheap.
@@ -917,11 +1357,31 @@ async function processPeerSymbol(row, index) {
     for (const peer of structuralPeers) {
       const nextEarningsDate = await getPeerNextEarningsDate(peer.symbol);
       if (!nextEarningsDate) continue;
+
+      // §4.5 — does this peer report on/adjacent to the traded symbol's own
+      // date? If so it is a co-reporter, not a sympathy catalyst. Flag, don't
+      // drop; the extension chooses the wording. False when the own date is
+      // unknown (cannot prove a collision).
+      const sameDateAsSelf = datesWithin(nextEarningsDate, ownNextEarningsDate, SAME_DATE_TOLERANCE_DAYS);
+
       peersWithEarnings.push({
         symbol: peer.symbol,
-        name: peer.symbol,             // screener rows carry no company name; use ticker
+        // FINDING E — the REAL company name, from the screener row.
+        //
+        // This previously read `name: peer.symbol` under the comment "screener
+        // rows carry no company name; use ticker". That comment was FALSE and
+        // was never checked against the payload: the screener returns `name`
+        // ("NVIDIA Corporation", "HSBC Holdings plc ADR") on every row, at zero
+        // additional cost. The batch was pulling it and throwing it away, then
+        // backfilling the ticker into the slot and rationalizing the loss.
+        //
+        // The fallback to the ticker REMAINS, but is now a genuine last resort
+        // for a row EODHD did not name — not the default path. A user-facing
+        // card must never render an empty or null company name.
+        name: peer.name || peer.symbol,
         marketCap: peer.marketCap,
         nextEarningsDate,              // "YYYY-MM-DD"; extension re-validates + orders
+        sameDateAsSelf,               // §4.5: true => co-reporter, NOT a sympathy catalyst
       });
     }
 
@@ -947,6 +1407,11 @@ async function processPeerSymbol(row, index) {
       return b.marketCap - a.marketCap;
     });
 
+    // §4.5 diagnostic: how many of this symbol's peers are co-reporters. Surfaced
+    // per-symbol so a symbol whose peers are ALL same-date (a weak card despite a
+    // non-empty peer list) is visible in the log rather than looking healthy.
+    const sameDateCount = peersWithEarnings.filter(p => p.sameDateAsSelf).length;
+
     // >=1 peer with an upcoming earnings date -> write the full block.
     const result = {
       symbol,
@@ -960,7 +1425,8 @@ async function processPeerSymbol(row, index) {
     console.log(
       `  ✓ ${symbol.padEnd(6)}: ${peersWithEarnings.length} peer(s)` +
       ` [${matchLevel}]` +
-      ` | nearest ${peersWithEarnings[0].nextEarningsDate}`   // already soonest-first
+      ` | nearest ${peersWithEarnings[0].nextEarningsDate}` +   // already soonest-first
+      (sameDateCount > 0 ? ` | ${sameDateCount} co-reporting` : '')
     );
     return 'written';
 
@@ -1154,6 +1620,7 @@ async function main() {
   let peerCase1     = 0;  // qualified-but-empty blocks (structurally peerless)
   let peerSkipped   = 0;  // has comparable peers but none reporting — no key
   let peerErrors    = 0;
+  peerDupesDropped  = 0;  // module-level (see decl); reset per run, NOT re-declared
   const peerStartTime = Date.now();
 
   const peerTotalBatches = Math.ceil(universeMeta.length / BATCH_SIZE);
@@ -1201,6 +1668,7 @@ async function main() {
   console.log(`  Case-1 (peerless):  ${peerCase1}  (qualified:[] — "no comparable peers" note)`);
   console.log(`  Skipped (no key):   ${peerSkipped}  (peers exist but none reporting — correct silence)`);
   console.log(`  Errors:             ${peerErrors}`);
+  console.log(`  Dup lines dropped:  ${peerDupesDropped}  (same-issuer share lines collapsed — Finding D)`);
   console.log(`  Phase 4 elapsed:    ${peerTotalMin} minutes`);
   console.log(`  Run finished:       ${new Date().toISOString()}`);
   console.log(divider);
